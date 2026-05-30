@@ -87,3 +87,115 @@ K2.5 (мультимодальность, MoonViT) → **K2.6 (~04.2026, ста�
 - Fireworks (MuonClip), Sebastian Raschka (The Big LLM Architecture Comparison),
   Simon Willison (K2 Thinking), NVIDIA / Microsoft Foundry / Cloudflare / DeepInfra / Verdent
   (карточки и обзоры K2.6)
+
+---
+
+# Устройство слоёв (deep dive)
+
+> Глубокий разбор того, как устроены слои модели. Бóльшая часть значений ниже подтверждена
+> побайтово: `config.json` читался с независимых GitHub-зеркал (HF отдавал HTTP 403), а
+> структура блока — из modeling-кода DeepSeek-V3 в HF `transformers`, который Kimi переиспользует.
+> Ключевой факт: `model_type: "kimi_k2"`, `architectures: ["DeepseekV3ForCausalLM"]` — то есть
+> Kimi K2 — это **блок DeepSeek-V3 один-в-один**, отличающийся только скалярными гиперпараметрами.
+
+## 1. Профиль глубины: 61 слой = 1 dense + 60 MoE
+| Поле config | Значение | Смысл |
+|---|---|---|
+| `num_hidden_layers` | 61 | всего трансформерных слоёв |
+| `first_k_dense_replace` | 1 | первый слой — обычный dense FFN, остальные 60 — MoE |
+| `moe_layer_freq` | 1 | начиная со 2-го слоя MoE на каждом слое |
+| `num_nextn_predict_layers` | 0 | **MTP-модуля в публичных весах нет** (у DeepSeek-V3 = 1) |
+| `tie_word_embeddings` | false | входные эмбеддинги и `lm_head` раздельные (не связаны) |
+| `vocab_size` | 163 840 | словарь («160K»), эмбеддинг 163840×7168 |
+
+- Первый слой делают dense, т.к. роутер на первом слое плохо балансирует нагрузку (то же
+  решение у DeepSeek-V3, но тот держит 3 dense-слоя — Kimi оставил 1).
+- Спекулятивное декодирование делается не через нативный MTP, а через **EAGLE3** и внешние
+  draft-модели (напр. `Kimi-K2-Instruct-DRAFT-0.6B`).
+
+## 2. Структура одного блока (pre-norm, два остаточных соединения)
+```
+residual = x
+x = input_layernorm(x)          # RMSNorm, eps 1e-6
+x = MLA_self_attention(x)
+x = residual + x                # остаточная связь №1
+residual = x
+x = post_attention_layernorm(x) # RMSNorm
+x = MLP(x)                      # слой 0: dense FFN; слои 1-60: MoE
+x = residual + x                # остаточная связь №2
+```
+- Нормализация: **RMSNorm** (`DeepseekV3RMSNorm`), классический **pre-norm**. Дополнительных
+  post-residual норм нет. Перед `lm_head` — финальный RMSNorm.
+
+## 3. Слой внимания MLA (Multi-head Latent Attention)
+- **64 головы** (у DeepSeek-V3 — 128). `attention_bias=false`.
+- Ветка запросов: `q_a_proj` (7168→**1536**) → `q_a_layernorm` (RMSNorm) → `q_b_proj`
+  (1536 → 64×192 = 12288).
+- Ветка KV: `kv_a_proj_with_mqa` (7168 → 512+64 = **576**) → `kv_a_layernorm` (RMSNorm над
+  латентом 512) → `kv_b_proj` (512 → 64×(128+128) = 16384).
+- Размер головы Q/K = `qk_nope_head_dim` (128, без позиции) + `qk_rope_head_dim` (64, RoPE) =
+  **192**; `v_head_dim` = 128. Decoupled RoPE применяется только к 64-мерному срезу.
+- **KV-кэш хранит лишь 576 значений на токен на слой** (латент 512 + общий rope-ключ 64),
+  независимо от числа голов → сокращение кэша ~10× → именно это делает 256K практичным.
+- Зачем 64 головы вместо 128: по техотчёту, на длине 128K удвоение голов даёт **+83% FLOPs**
+  инференса при незначительном приросте качества — критично для агентных длинно-контекстных сценариев.
+
+## 4. Слой MoE (слои 1–60) и роутер
+| Поле | Значение |
+|---|---|
+| `n_routed_experts` | 384 (у DeepSeek-V3 — 256) |
+| `num_experts_per_tok` | 8 routed на токен |
+| `n_shared_experts` | 1 (всегда активен, параллельно, сумма с routed) |
+| `moe_intermediate_size` | 2048 (ширина FFN каждого эксперта) |
+| `intermediate_size` (dense-слой 0) | 18432 (≈ выведено из DeepSeek-V3) |
+| `scoring_func` | **sigmoid**-гейтинг (не softmax) |
+| `topk_method` | **noaux_tc** — балансировка без aux-loss, через обучаемый per-expert bias |
+| `norm_topk_prob` | true (веса 8 выбранных экспертов нормируются) |
+| `n_group` / `topk_group` | **1 / 1** — Kimi **убрал** group-routing DeepSeek-V3 (8/4) |
+
+- Каждый эксперт — SwiGLU-FFN: `down_proj(silu(gate_proj(x)) * up_proj(x))`, без bias.
+- На токен активны 8 routed + 1 shared = **9 экспертов**.
+- Арифметика: ~3×7168×2048 ≈ **44M параметров на эксперта** → ×384 ≈ 16.9B на MoE-слой → ×60
+  слоёв доминируют в ~1.04T общих; активны 9/385 → ~32B на токен.
+- Убрали группы экспертов, потому что при 384 экспертах и большом expert-parallel группировка
+  перестала помогать балансировке нагрузки — это реальное отличие от DeepSeek-V3.
+
+## 5. Длинный контекст (4K → 32K → 128K → 256K)
+- Претрейн: 400B токенов на **4K**, затем +60B на **32K**, затем расширение YaRN до 128K.
+- 256K — свойство поколения **K2-0905 / K2.5 / Thinking / K2.6**. В прочитанном конфиге
+  256K-класса: `max_position_embeddings = 262144`, `rope_theta = 50000`, YaRN
+  `factor = 64`, `original_max_position_embeddings = 4096`.
+- ⚠️ Расхождение источников: исходный K2-Instruct (128K) описывается с YaRN
+  `original_max_position_embeddings = 32768` и `factor ≈ 4` (по веб-сниппетам, без байтового
+  чтения). Трактую как **разницу между 128K- и 256K-вариантами**, а не как ошибку.
+
+## 6. Vision-слои (K2.5 / K2.6)
+> Первичный источник — техотчёт **K2.5: arXiv:2602.02276** («Visual Agentic Intelligence»).
+> Для K2.6 отдельного отчёта нет — vision-стек переиспользован (вторичные источники).
+- Конвейер: **MoonViT-3D** (визуальный энкодер ~400M, инициализирован из **SigLIP-SO-400M**) →
+  **pixel-shuffle** (2×2 пространственное сжатие) → **2-слойный MLP-проектор** → визуальные
+  токены попадают в **тот же 61-слойный MoE-backbone**, что и текст (единая последовательность).
+- Нативное разрешение (NaViT-упаковка патчей в 1D). Видео: кадры группами по 4, усреднение
+  патчей по времени (лёгкое 3D-сжатие). Число слоёв самого MoonViT не раскрыто.
+
+## 7. Квантизация по слоям (K2 Thinking / K2.6)
+- Нативный **INT4 (w4a16) через QAT**, формат `compressed-tensors`: в INT4 переведены **только
+  веса MoE-экспертов**, а внимание (MLA) и shared-эксперт остаются в BF16.
+
+## Источники (deep dive)
+- Kimi K2 Technical Report — arXiv:2507.20534
+- Kimi K2.5 Technical Report — arXiv:2602.02276 («Kimi K2.5: Visual Agentic Intelligence»)
+- DeepSeek-V3 — arXiv:2412.19437; HF `transformers/models/deepseek_v3/modeling_deepseek_v3.py`
+- Официальный `MoonshotAI/Kimi-K2` README + `deploy_guidance.md`; `configuration_deepseek.py`
+- `config.json` через GitHub-зеркала Kimi-K2 / Kimi-K2.5 (HF давал 403)
+- Sebastian Raschka (MLA / The Big LLM Architecture Comparison), IntuitionLabs, Composio
+
+### Оговорки о достоверности
+- **Высокая** (байтовое чтение / official README / modeling-код): профиль 61=1+60,
+  `first_k_dense_replace`, RMSNorm + pre-norm + порядок подслоёв, две остаточные связи,
+  MLA-проекции и размерности (64 головы, 512/1536, 128/64/128), MoE 384/8/1, SwiGLU,
+  `n_group=1`, `rope_theta=50000`, `max_position_embeddings=262144`.
+- **Средняя** (DeepSeek-V3-инференс / вторичные): dense `intermediate_size=18432`,
+  `routed_scaling_factor≈2.5`, `rms_norm_eps=1e-6`, MTP-поле `=0` vs отсутствует.
+- **Средняя/первичная для K2.5** (arXiv:2602.02276), но **вторичная для K2.6**: vision-стек
+  MoonViT; точное число слоёв MoonViT не раскрыто.
