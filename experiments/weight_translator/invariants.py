@@ -41,6 +41,16 @@ def featurize(p, mode="inv", cfg=CFG):
                 if k not in ("l0_Wq", "l0_Wk")]
         return np.concatenate(feat + base)
 
+    if mode == "kpos":
+        # σ-РАЗВЯЗАННЫЙ признак: только позиционные логиты (несут лаг k), без G/σ.
+        MQK = np.zeros((d, d)); MOV = np.zeros((d, d))
+        for s in blk:
+            MQK += p["l0_Wq"][:, s] @ p["l0_Wk"][:, s].T
+            MOV += p["l0_Wv"][:, s] @ p["l0_Wo"][s, :]
+        Spos = p["pos"] @ MQK @ p["pos"].T              # (L,L) — лаг k
+        Sov = p["pos"] @ MOV @ p["pos"].T               # (L,L)
+        return np.concatenate([Spos.reshape(-1), Sov.reshape(-1)])
+
     if mode == "inv2":
         # базис-инвариантные признаки задачи (инвар. к глоб. сопряжению M->P^T M P)
         MQK = np.zeros((d, d)); MOV = np.zeros((d, d))
