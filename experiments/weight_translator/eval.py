@@ -11,7 +11,8 @@ from train_translator import make_features
 def predict_B(H, params, augment_rng=None):
     feat = make_features(params, H["mode"], H["mu"], H["sd"], rng=augment_rng)
     tt = to_tensors(H["tp"], requires_grad=False)
-    bp = translator.translate(tt, feat, H["spec"])
+    bp = translator.translate(tt, params, feat, H["spec"],
+                              variant=H.get("variant", "linear"), cfg=H["cfg"])
     return {k: v.data.copy() for k, v in bp.items()}
 
 

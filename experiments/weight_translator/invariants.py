@@ -41,6 +41,26 @@ def featurize(p, mode="inv", cfg=CFG):
                 if k not in ("l0_Wq", "l0_Wk")]
         return np.concatenate(feat + base)
 
+    if mode == "inv2":
+        # базис-инвариантные признаки задачи (инвар. к глоб. сопряжению M->P^T M P)
+        MQK = np.zeros((d, d)); MOV = np.zeros((d, d))
+        for s in blk:
+            MQK += p["l0_Wq"][:, s] @ p["l0_Wk"][:, s].T
+            MOV += p["l0_Wv"][:, s] @ p["l0_Wo"][s, :]
+        G = p["emb"] @ p["unemb"]                       # (V,V) — несёт sigma
+        Spos = p["pos"] @ MQK @ p["pos"].T              # (L,L) — несёт лаг k
+        Sov = p["pos"] @ MOV @ p["pos"].T               # (L,L)
+        sv_qk = np.linalg.svd(MQK, compute_uv=False)    # инвар. к ортогон. сопряжению
+        sv_ov = np.linalg.svd(MOV, compute_uv=False)
+        ge = np.zeros((d, d)); ue = np.zeros((d, d)); de = np.zeros((d, d))
+        for e in range(E):
+            g = p[f"l0_e{e}_gate"]; u = p[f"l0_e{e}_up"]; dn = p[f"l0_e{e}_down"]
+            ge += g @ g.T; ue += u @ u.T; de += dn.T @ dn
+        sv_e = np.concatenate([np.linalg.svd(m, compute_uv=False)
+                               for m in (ge, ue, de)])
+        return np.concatenate([G.reshape(-1), Spos.reshape(-1), Sov.reshape(-1),
+                               sv_qk, sv_ov, sv_e])
+
     # mode == 'inv'
     feat = []
     MQK = np.zeros((d, d)); MOV = np.zeros((d, d))

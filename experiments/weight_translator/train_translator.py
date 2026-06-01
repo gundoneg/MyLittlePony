@@ -25,13 +25,15 @@ def make_features(params, mode, mu, sd, rng=None):
 
 
 def train_translator(zoo, mode, cfg=target.CFG, iters=400, lr=3e-3, d_z=8,
-                     tasks_per_step=8, augment=True, seed=0, verbose=True):
+                     tasks_per_step=8, augment=True, seed=0, variant="linear",
+                     verbose=True):
     rng = np.random.default_rng(seed)
     spec, P = translator.b_spec(cfg)
     mu, sd = compute_standardizer(zoo, mode)
     F = (featurize(zoo[0]["params"], mode)).shape[0]
     theta0 = flatten(target.init_params(np.random.default_rng(123), cfg))[0]
-    tp = translator.init_translator(rng, F, P, d_z=d_z, theta0=theta0)
+    tp = translator.init_translator(rng, F, spec, variant=variant, d_z=d_z,
+                                    theta0=theta0, cfg=cfg)
     opt = Adam(tp, lr=lr)
 
     n = len(zoo)
@@ -43,7 +45,8 @@ def train_translator(zoo, mode, cfg=target.CFG, iters=400, lr=3e-3, d_z=8,
             z = zoo[j]
             feat = make_features(z["params"], mode, mu, sd,
                                  rng=rng if augment else None)
-            bp = translator.translate(tt, feat, spec)
+            bp = translator.translate(tt, z["params"], feat, spec,
+                                      variant=variant, cfg=cfg)
             x, y = data.sample_batch(z["task"], rng, batch=48,
                                      V=cfg["V"], L=cfg["L"])
             lg = target.forward(bp, x, cfg)
@@ -54,5 +57,6 @@ def train_translator(zoo, mode, cfg=target.CFG, iters=400, lr=3e-3, d_z=8,
         loss.backward()
         opt.step(tp, {k: tt[k].grad for k in tp})
         if verbose and (it + 1) % max(1, iters // 5) == 0:
-            print(f"    [{mode}] it={it+1:4d} loss={float(loss.data):.3f}")
-    return {"tp": tp, "spec": spec, "mu": mu, "sd": sd, "mode": mode, "cfg": cfg}
+            print(f"    [{mode}/{variant}] it={it+1:4d} loss={float(loss.data):.3f}")
+    return {"tp": tp, "spec": spec, "mu": mu, "sd": sd, "mode": mode,
+            "cfg": cfg, "variant": variant}
