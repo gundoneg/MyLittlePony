@@ -61,11 +61,12 @@ class LinAttMixer(nn.Module):
     """Causal linear attention (FAVOR+). Holds the donor's q/k/v/o projections;
     mode='softmax' falls back to exact attention (hybrid escape hatch)."""
 
-    def __init__(self, cfg: LlamaCfg, num_features=256, seed=0, mode="linear", eps=1e-6):
+    def __init__(self, cfg: LlamaCfg, num_features=256, seed=0, mode="linear",
+                 eps=1e-6, feat="favor"):
         super().__init__()
         H, hd = cfg.hidden, cfg.head_dim
         self.nh, self.nkv, self.hd = cfg.n_head, cfg.n_kv_head, hd
-        self.m, self.eps, self.mode = num_features, eps, mode
+        self.m, self.eps, self.mode, self.feat = num_features, eps, mode, feat
         self.scale = hd ** -0.25
         self.q_proj = nn.Linear(H, cfg.n_head * hd, bias=False)
         self.k_proj = nn.Linear(H, cfg.n_kv_head * hd, bias=False)
