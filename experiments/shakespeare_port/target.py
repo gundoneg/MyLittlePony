@@ -37,6 +37,7 @@ class SSMMixer(nn.Module):
         self.c = nn.Parameter(torch.ones(d) * 0.5)
         self.d_skip = nn.Parameter(torch.zeros(d))
         self.out_proj = nn.Linear(d, d)
+        self.in_silu = True   # zero-shot port sets this False (linear value path, like attention's V)
 
     def ssm_kernel(self, L):
         # K[tau] for tau = 0..L-1, shape (d, L)
@@ -60,7 +61,8 @@ class SSMMixer(nn.Module):
         B, T, d = x.shape
         u = self.in_proj(x).transpose(1, 2)              # (B, d, T)
         u = self.conv(u)[:, :, :T]                       # short causal conv
-        u = F.silu(u)
+        if self.in_silu:
+            u = F.silu(u)
         y = self.causal_ssm(u)                           # diagonal LTI SSM
         y = y.transpose(1, 2)                            # (B, T, d)
         y = y * F.silu(self.gate_proj(x))                # gating

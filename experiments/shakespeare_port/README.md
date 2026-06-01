@@ -99,12 +99,77 @@ I hear the king, that I do confess.     Why, then I am not the king of Richard's
 Both produce recognizable (if not coherent) Shakespeare with character cues,
 verse line breaks, and period diction — at near-identical perplexity.
 
+Both produce recognizable (if not coherent) Shakespeare — at near-identical
+perplexity. NOTE: this distillation port uses **teacher inference**, a standard
+regime but *different* from the zero-shot, no-inference map below.
+
+---
+
+# Zero-shot, NO-inference, NO-data weight port (the real method)
+
+`port_zeroshot.py` (our from-scratch donor) and `llama_port.py` (a real
+downloaded model) implement the genuine regime: read a trained Transformer's
+weights and emit an SSM's weights by a **closed-form map** — nothing is trained,
+no data is seen, the teacher is never run.
+
+  * `emb` / `unembedding` / RMSNorms / FFN  → copied **verbatim** (gauge-free
+    bridge: shared vocab and `d_model` make these architecture-agnostic).
+  * attention → SSM mixer → closed form: `in_proj ← V`, `out_proj ← O`
+    (GQA value heads expanded to full width), short conv → identity, and the
+    diagonal LTI kernel set to a normalized recency average `K[τ]=(1-a)·aᵀ`
+    (per-channel decay `a` spread across a fixed range). RoPE is dropped — the
+    SSM's causal kernel carries position. Gate → constant 1.
+
+This is *content-free*: attention routes by content, an LTI-SSM cannot, so the
+temporal mixing is replaced by a fixed recency kernel. The channel-mixing parts
+of attention (V, O) and everything else transfer exactly. We measure how far the
+pure transplant gets, with **zero training**.
+
+### Result A — our from-scratch donor (2-layer, vocab 2048)
+
+| model | val perplexity |
+|-------|---------------:|
+| donor Transformer | 21.8 |
+| **ported SSM (0 inference, 0 data)** | **33.6** |
+| random SSM | 2377 |
+
+→ ~**91%** of the way from random to donor in log-perplexity, with no training.
+Ported-SSM sample (no training): *"ROMEO: ...our the Tower, That my minds are...
+The days and this royal words, When the war"*.
+
+### Result B — a real downloaded model: `SupraLabs/Supra-50M-Instruct`
+
+A 50M-param **Llama** SLM (12 layers, d=512, 8 heads / 4 KV GQA, RoPE, RMSNorm,
+SwiGLU, vocab 32000), downloaded on a phone and delivered via a GitHub Release
+(HuggingFace is blocked in the exec container). Perplexity measured with the
+model's own tokenizer.
+
+| model | val perplexity |
+|-------|---------------:|
+| donor Llama (works: coherent English) | 130.8 |
+| **ported SSM (0 inference, 0 data)** | **~1015** |
+| random SSM | 40272 |
+
+→ ~**64%** of the way in log-perplexity, with no training. The ported SSM emits
+broken-but-English text. The bigger gap vs Result A is the honest finding: on a
+deeper, genuinely attention-reliant *pretrained* model, error compounds across
+12 layers and the fixed recency kernel is a cruder stand-in for content-based
+attention. Robust to the kernel prior (ppl ≈ 1010–1030 across a wide range of
+decays).
+
+Reproduce:
+```bash
+# place config.json, model.safetensors, tokenizer.json in models/supra50m/
+python llama_port.py --prompt "The meaning of life is"
+```
+
 ## Honest caveats
 
-- These are *tiny* from-scratch models (~4–5M params); output is Shakespeare-ish,
-  not coherent prose.
-- This port uses **teacher inference** (distillation) — a standard regime, and
-  deliberately *different* from the zero-shot, no-inference weight translation in
-  the numpy lab. What carries over is the gauge-free `emb`/`unemb` bridge and the
-  conv-augmented SSM mixer; the interior is fit by distillation rather than a
-  learned weight map.
+- The zero-shot port is **lossy by construction**: an LTI-SSM has no
+  content-based routing, so it cannot fully replace attention without either a
+  *selective* (input-dependent) SSM or some distillation — and distillation
+  needs inference, a different regime.
+- The from-scratch Shakespeare models are *tiny* (~4–5M params); output is
+  Shakespeare-ish, not coherent prose.
+- What is genuinely reusable and architecture-agnostic is the gauge-free
+  `emb`/`unemb`/norm/FFN transfer plus the closed-form attention→SSM mixer map.
