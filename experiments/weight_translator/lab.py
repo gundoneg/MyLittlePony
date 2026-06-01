@@ -14,23 +14,27 @@ from train_zoo import build_zoo
 from train_translator import train_translator
 from eval import transfer_benchmark, gauge_robustness
 
-CACHE = "zoo_cache.pkl"
+def cache_name(tied):
+    return "zoo_cache_tied.pkl" if tied else "zoo_cache.pkl"
 
 
-def build_cache(n_train, n_held, donor_iters):
+def build_cache(n_train, n_held, donor_iters, tied=False):
     train_tasks, held_tasks = data.make_task_split(0, n_train, n_held)
-    print(f"[build] train={n_train} held={n_held} donor_iters={donor_iters}")
-    tz = build_zoo(train_tasks, iters=donor_iters, base_seed=1000, verbose=False)
-    hz = build_zoo(held_tasks, iters=donor_iters, base_seed=5000, verbose=False)
-    meta = dict(n_train=n_train, n_held=n_held, donor_iters=donor_iters)
-    with open(CACHE, "wb") as f:
+    init = 42 if tied else None        # общий init_seed => общий базис у всех доноров
+    print(f"[build] train={n_train} held={n_held} donor_iters={donor_iters} tied={tied}")
+    tz = build_zoo(train_tasks, iters=donor_iters, base_seed=1000, verbose=False,
+                   init_seed=init)
+    hz = build_zoo(held_tasks, iters=donor_iters, base_seed=5000, verbose=False,
+                   init_seed=init)
+    meta = dict(n_train=n_train, n_held=n_held, donor_iters=donor_iters, tied=tied)
+    with open(cache_name(tied), "wb") as f:
         pickle.dump({"train": tz, "held": hz, "meta": meta}, f)
     print(f"[build] donor acc train={np.mean([z['acc'] for z in tz]):.3f} "
-          f"held={np.mean([z['acc'] for z in hz]):.3f} -> {CACHE}")
+          f"held={np.mean([z['acc'] for z in hz]):.3f} -> {cache_name(tied)}")
 
 
-def load_cache():
-    with open(CACHE, "rb") as f:
+def load_cache(tied=False):
+    with open(cache_name(tied), "rb") as f:
         d = pickle.load(f)
     return d["train"], d["held"], d["meta"]
 
@@ -57,17 +61,18 @@ def main():
     ap.add_argument("--htrain", type=int, default=500)
     ap.add_argument("--ft", type=int, default=25)
     ap.add_argument("--d_z", type=int, default=8)
-    ap.add_argument("--configs", default="linear:inv,mlp:inv,structured:inv")
+    ap.add_argument("--configs", default="linear:inv2,struct2:kpos,structured:kpos")
     ap.add_argument("--wd", type=float, default=0.0)
+    ap.add_argument("--tied", action="store_true")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    if args.build or not os.path.exists(CACHE):
-        build_cache(args.n_train, args.n_held, args.donor_iters)
+    if args.build or not os.path.exists(cache_name(args.tied)):
+        build_cache(args.n_train, args.n_held, args.donor_iters, tied=args.tied)
     if not args.run:
         return
 
-    tz, hz, meta = load_cache()
+    tz, hz, meta = load_cache(args.tied)
     print(f"[run] zoo {meta} | random-init базовый общий")
     configs = [c.split(":") for c in args.configs.split(",")]
     rows = {}

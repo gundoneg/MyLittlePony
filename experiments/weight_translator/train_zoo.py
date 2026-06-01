@@ -35,11 +35,14 @@ def eval_params(mod, p, task, rng, n=256, cfg=donor.CFG):
     return float((pred == y.reshape(-1)).mean())
 
 
-def build_zoo(tasks, iters=200, base_seed=1000, cfg=donor.CFG, verbose=True):
+def build_zoo(tasks, iters=200, base_seed=1000, cfg=donor.CFG, verbose=True,
+              init_seed=None):
+    """init_seed=None -> independent init (как раньше); int -> tied-init (общий базис)."""
     zoo = []
     rng = np.random.default_rng(7)
     for i, task in enumerate(tasks):
-        p = train_one_donor(task, base_seed + i, iters=iters, cfg=cfg)
+        p = train_one_donor(task, base_seed + i, iters=iters, cfg=cfg,
+                            init_seed=init_seed)
         acc = eval_params(donor, p, task, rng, cfg=cfg)
         zoo.append({"task": task, "params": p, "acc": acc})
         if verbose:

@@ -145,6 +145,15 @@ def gauge_transform(p, rng, cfg=CFG):
     return q
 
 
+def relabel_vocab(p, pi, rho):
+    """Перепометка словаря: вход-токены перестановкой pi (строки emb),
+    выход-токены rho (столбцы unemb). Переводит задачу (σ,k)->(ρσπ⁻¹,k)."""
+    q = {k: v.copy() for k, v in p.items()}
+    q["emb"] = p["emb"][pi]
+    q["unemb"] = p["unemb"][:, rho]
+    return q
+
+
 # ------------------------------------------------------------ self-check
 def verify(seed=0):
     import numpy as np
@@ -168,6 +177,20 @@ def verify(seed=0):
     assert idiff < 1e-8, "инварианты НЕ инвариантны!"
     assert rdiff > 1e-2, "raw неожиданно инвариантны"
     print("OK: gauge-ops — симметрии; инварианты инвариантны; raw — нет.")
+
+    # S_V: перепометка словаря — kpos инвариантен, G эквивариантен (P_pi G P_rho^T)
+    V = p["emb"].shape[0]
+    pi, rho = rng.permutation(V), rng.permutation(V)
+    r = relabel_vocab(p, pi, rho)
+    kdiff = np.max(np.abs(featurize(p, "kpos") - featurize(r, "kpos")))
+    G = p["emb"] @ p["unemb"]
+    Gr = r["emb"] @ r["unemb"]
+    geq = np.max(np.abs(Gr - G[pi][:, rho]))
+    print(f"S_V relabel: kpos Δ={kdiff:.2e} (инвар., ~0); "
+          f"G−P_πGP_ρᵀ={geq:.2e} (эквивар., ~0)")
+    assert kdiff < 1e-10, "kpos НЕ S_V-инвариантен!"
+    assert geq < 1e-10, "G НЕ S_V-эквивариантен!"
+    print("OK: kpos S_V-инвариантен; G S_V-эквивариантен (носитель σ).")
 
 
 if __name__ == "__main__":
