@@ -35,12 +35,16 @@ def load_cache():
     return d["train"], d["held"], d["meta"]
 
 
-def run_config(tz, hz, variant, mode, htrain=500, ft=25, N=12, d_z=8, seed=0):
+def run_config(tz, hz, variant, mode, htrain=500, ft=25, N=12, d_z=8, seed=0, wd=0.0):
+    from eval import predict_B, task_acc
     H = train_translator(tz, mode, iters=htrain, tasks_per_step=min(8, len(tz)),
-                         variant=variant, d_z=d_z, seed=seed, verbose=False)
+                         variant=variant, d_z=d_z, seed=seed, wd=wd, verbose=False)
     tb = transfer_benchmark(H, hz, ft_steps=ft)
     gr = gauge_robustness(H, hz, N=N)
-    return {**tb, **gr}
+    rng = np.random.default_rng(11)
+    ztr = float(np.mean([task_acc(predict_B(H, z["params"]), z["task"], rng)
+                         for z in tz[:min(8, len(tz))]]))
+    return {**tb, **gr, "zero_train": ztr}
 
 
 def main():
@@ -54,6 +58,7 @@ def main():
     ap.add_argument("--ft", type=int, default=25)
     ap.add_argument("--d_z", type=int, default=8)
     ap.add_argument("--configs", default="linear:inv,mlp:inv,structured:inv")
+    ap.add_argument("--wd", type=float, default=0.0)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -69,11 +74,11 @@ def main():
     t0 = time.time()
     for variant, mode in configs:
         r = run_config(tz, hz, variant, mode, htrain=args.htrain,
-                       ft=args.ft, d_z=args.d_z)
+                       ft=args.ft, d_z=args.d_z, wd=args.wd)
         rows[f"{variant}:{mode}"] = r
-        print(f"  {variant:11}:{mode:4}  zero={r['zero_shot']:.3f} "
-              f"warm={r['warm_start_ft']:.3f} rnd={r['random_ft']:.3f} "
-              f"feat_std={r['feat_std']:.1e} acc_std={r['acc_std_under_gauge']:.3f}")
+        print(f"  {variant:11}:{mode:4}  zeroHELD={r['zero_shot']:.3f} "
+              f"zeroTRAIN={r['zero_train']:.3f} warm={r['warm_start_ft']:.3f} "
+              f"rnd={r['random_ft']:.3f} feat_std={r['feat_std']:.1e}")
 
     print("\n=========== СВОДКА ===========")
     print(f"{'config':18}{'zero':>7}{'warm':>7}{'random':>8}{'feat_std':>11}{'acc_std':>9}")

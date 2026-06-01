@@ -26,7 +26,7 @@ def make_features(params, mode, mu, sd, rng=None):
 
 def train_translator(zoo, mode, cfg=target.CFG, iters=400, lr=3e-3, d_z=8,
                      tasks_per_step=8, augment=True, seed=0, variant="linear",
-                     verbose=True):
+                     wd=0.0, verbose=True):
     rng = np.random.default_rng(seed)
     spec, P = translator.b_spec(cfg)
     mu, sd = compute_standardizer(zoo, mode)
@@ -56,6 +56,10 @@ def train_translator(zoo, mode, cfg=target.CFG, iters=400, lr=3e-3, d_z=8,
         loss = loss * (1.0 / len(idx))
         loss.backward()
         opt.step(tp, {k: tt[k].grad for k in tp})
+        if wd > 0.0:                              # decoupled weight decay (на M и W*)
+            for k in tp:
+                if k.startswith(("M", "W", "Wee", "Wuu", "Wpp")):
+                    tp[k] -= lr * wd * tp[k]
         if verbose and (it + 1) % max(1, iters // 5) == 0:
             print(f"    [{mode}/{variant}] it={it+1:4d} loss={float(loss.data):.3f}")
     return {"tp": tp, "spec": spec, "mu": mu, "sd": sd, "mode": mode,
