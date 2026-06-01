@@ -10,9 +10,11 @@ from nn import to_tensors, Adam
 import donor, data
 
 
-def train_one_donor(task, seed, iters=200, lr=5e-3, batch=64, cfg=donor.CFG):
+def train_one_donor(task, seed, iters=200, lr=5e-3, batch=64, cfg=donor.CFG,
+                    init_seed=None):
     rng = np.random.default_rng(seed)
-    p = donor.init_params(rng, cfg)
+    p = donor.init_params(np.random.default_rng(init_seed) if init_seed is not None
+                          else rng, cfg)
     opt = Adam(p, lr=lr)
     for it in range(iters):
         x, y = data.sample_batch(task, rng, batch=batch, V=cfg["V"], L=cfg["L"])
