@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
-full_run.log
+*.log
 *.pkl
 lab_*.json
-*.log
