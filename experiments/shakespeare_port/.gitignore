@@ -1,0 +1,4 @@
+data/input.txt
+data/ids.json
+*.pt
+*.log
