@@ -93,7 +93,7 @@ class CStruct(nn.Module):
 
 # ----------------------------- train / eval -----------------------------
 def run_B(template, params, x, y, vocab):
-    logits = functional_call(template, params, (x,))
+    logits = functional_call(template, params, (x,))[0]
     return F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1)), logits
 
 
@@ -109,7 +109,7 @@ def eval_C(C, template, zoo, data, c, split, iters=15, bs=64):
         for _ in range(iters):
             x, y = cipher_batch(data, z["perm"], "val", bs, c.ctx, g)
             loss, logits = run_B(template, params, x, y, c.vocab)
-            la = functional_call(A_tmpl, z["A"], (x,))
+            la = functional_call(A_tmpl, z["A"], (x,))[0]
             ce += loss.item()
             ag += (logits.argmax(-1) == la.argmax(-1)).float().mean().item()
         ces.append(ce / iters); agrees.append(ag / iters)
