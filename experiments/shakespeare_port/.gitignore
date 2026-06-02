@@ -1,0 +1,7 @@
+data/input.txt
+data/ids.json
+*.pt
+*.log
+__pycache__/
+models/
+*.safetensors
