@@ -30,27 +30,16 @@ def _row(label, idv, r):
     return (f"{label:>16} {idv:>8.3f} | {r['m0']:>7.1%} {r['m1']:>9.1%} {r['m2']:>9.1%}")
 
 
-def _ascii_curve(points, chance, width=44):
-    """points: list of (interior_div, m0). Plot m0 (y) vs interior_div (x)."""
-    print("\n  ASCII curve  —  M0 sigma-recovery vs interior-divergence")
-    print(f"  100% |{'recoverable':>{width}}")
-    xs = [p[0] for p in points]
-    xmax = max(xs + [1.41])
-    for frac in (1.0, 0.75, 0.5, 0.25):
-        line = [" "] * width
-        for idv, m0 in points:
-            col = min(width - 1, int(idv / xmax * (width - 1)))
-            if m0 >= frac - 0.125 and m0 < frac + 0.125:
-                line[col] = "*"
-        print(f"  {frac:>3.0%} |" + "".join(line))
-    base = [" "] * width
-    for idv, m0 in points:
-        col = min(width - 1, int(idv / xmax * (width - 1)))
-        if m0 < 0.125:
-            base[col] = "*"
-    print(f"  {chance:>4.1%}|" + "".join(base) + "  (chance floor)")
-    print(f"       +{'-'*width}")
-    print(f"        0{'interior divergence ->':^{width-6}}{xmax:.2f}")
+def _ascii_curve(points, chance, width=40):
+    """points: list of (align, interior_div, m0). One bar per point: M0 vs the
+    interior divergence it produced, sorted by divergence (the natural x-axis)."""
+    print("\n  M0 sigma-recovery  vs  interior-divergence  (each row = one anchor)")
+    print(f"  {'int_div':>7}  {'M0':>5}  0%{'':<{width-4}}100%")
+    for _a, idv, m0 in sorted(points, key=lambda p: p[1]):
+        fill = int(round(m0 * width))
+        bar = "#" * fill + "." * (width - fill)
+        print(f"  {idv:>7.3f}  {m0:>5.0%}  |{bar}|")
+    print(f"  (chance floor = {chance:.1%}; the cliff is the row where '#' collapses to '.')")
 
 
 def main():
@@ -77,7 +66,7 @@ def main():
     for a in (1.0, 0.85, 0.7, 0.6, 0.5, 0.3, 0.0):
         idv, r = run(c, data, align=a, div=0.0, n=args.n, steps=args.steps)
         print(_row(f"align={a:.2f}", idv, r))
-        curve.append((idv, r["m0"]))
+        curve.append((a, idv, r["m0"]))
     _ascii_curve(curve, chance)
 
     # --- Table B: data order is a non-factor (sweep div at both ends) ---
