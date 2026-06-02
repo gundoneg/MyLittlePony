@@ -106,12 +106,21 @@ def _blend_init(W, base, perm, align):
 
 
 def train_donor(c, data, perm, steps, donor_id, div, align,
-                base_tok=None, base_head=None, bs=32, lr=3e-3, init_seed=0):
+                base_tok=None, base_head=None, bs=32, lr=3e-3, init_seed=0,
+                noise=0.0, anchor_lam=0.0):
     torch.manual_seed(init_seed)
     A = LM(c, "transformer")
     if align is not None:
         _blend_init(A.tok.weight, base_tok, perm, align)
         _blend_init(A.head.weight, base_head, perm, align)
+    if noise > 0.0:
+        # donor-specific init perturbation: a second, independent way to inject
+        # divergence on top of a clean (align=1) char anchor.
+        gn = torch.Generator().manual_seed(5000 + donor_id)
+        A.tok.weight.data += noise * torch.randn(A.tok.weight.shape, generator=gn)
+        A.head.weight.data += noise * torch.randn(A.head.weight.shape, generator=gn)
+    # anchor regulariser pulls char c's CURRENT embedding (row perm[c]) toward the
+    # shared per-char reference base[c] -> can re-create readability during training.
     opt = torch.optim.AdamW(A.parameters(), lr=lr)
     coin, shared_g, priv_g = _step_generators(donor_id, SHARED_DATA_SEED, PRIV_DATA_SEED)
     A.train()
@@ -119,6 +128,10 @@ def train_donor(c, data, perm, steps, donor_id, div, align,
         g = _pick(coin, shared_g, priv_g, div)
         x, y = batch(data, "train", perm, bs, c.ctx, g)
         _, loss = A(x, y)
+        if anchor_lam > 0.0:
+            reg = ((A.tok.weight[perm] - base_tok) ** 2).mean() \
+                + ((A.head.weight[perm] - base_head) ** 2).mean()
+            loss = loss + anchor_lam * reg
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -181,11 +194,14 @@ def interior_divergence(zoo):
 
 
 def build_zoo(c, data, n_train=8, n_held=4, steps=600, div=0.0,
-              align=1.0, indep_init=False, with_b=True, verbose=True):
+              align=1.0, indep_init=False, noise=0.0, anchor_lam=0.0,
+              with_b=True, verbose=True):
     """Build donors. `align` (0=tied .. 1=char-aligned) is the init-anchor knob;
-    `indep_init` gives each donor its own random init (no shared base at all)."""
+    `indep_init` gives each donor its own random init (no shared base at all);
+    `noise` adds donor-specific init perturbation; `anchor_lam` regularises each
+    char's embedding toward a shared per-char reference during training."""
     n = n_train + n_held
-    use_base = (align is not None) and (not indep_init)
+    use_base = ((align is not None) and (not indep_init)) or anchor_lam > 0.0
     base_tok, base_head = make_base_init(c) if use_base else (None, None)
     zoo = []
     t0 = time.time()
@@ -195,7 +211,8 @@ def build_zoo(c, data, n_train=8, n_held=4, steps=600, div=0.0,
         a_align = None if (indep_init or align is None) else align
         a_init = (1 + i) if indep_init else 0
         A = train_donor(c, data, perm, steps, donor_id=i, div=div, align=a_align,
-                        base_tok=base_tok, base_head=base_head, init_seed=a_init)
+                        base_tok=base_tok, base_head=base_head, init_seed=a_init,
+                        noise=noise, anchor_lam=anchor_lam)
         B = distill_target(A, c, data, perm, steps, donor_id=i, div=div) if with_b else None
         a_ce, b_ce, agree = evaluate(A, B, c, data, perm)
         zoo.append(dict(split=split, perm=perm, A=A.state_dict(),
@@ -219,6 +236,10 @@ def main():
                     help="init anchor: 1=char-aligned (clean), 0=tied (no per-char anchor)")
     ap.add_argument("--indep_init", action="store_true",
                     help="each donor gets its own random init (overrides --align)")
+    ap.add_argument("--noise", type=float, default=0.0,
+                    help="donor-specific init perturbation on tok/head (2nd divergence axis)")
+    ap.add_argument("--anchor_lam", type=float, default=0.0,
+                    help="weight of the shared per-char anchor regulariser during training")
     ap.add_argument("--no_b", dest="with_b", action="store_false", default=True,
                     help="skip SSM distillation (only A donors; faster for sigma-recovery)")
     ap.add_argument("--out", default="zoo.pt")
@@ -237,8 +258,9 @@ def main():
 
     zoo = build_zoo(c, data, args.n_train, args.n_held, args.steps,
                     div=args.div, align=args.align, indep_init=args.indep_init,
-                    with_b=args.with_b)
-    meta = dict(div=args.div, align=args.align, indep_init=args.indep_init)
+                    noise=args.noise, anchor_lam=args.anchor_lam, with_b=args.with_b)
+    meta = dict(div=args.div, align=args.align, indep_init=args.indep_init,
+                noise=args.noise, anchor_lam=args.anchor_lam)
     torch.save(dict(cfg=c.__dict__, zoo=zoo, meta=meta), args.out)
 
     div_mean = sum(z["interior_div"] for z in zoo[1:]) / max(len(zoo) - 1, 1)

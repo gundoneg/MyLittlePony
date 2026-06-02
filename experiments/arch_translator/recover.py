@@ -70,6 +70,45 @@ def recover_m1(state_i, state0, cfg):
     return torch.tensor(assign_from_similarity(sim))
 
 
+# --------------------------- M3: alternating refine + consensus -------------
+def _procrustes(A, B):
+    """Orthogonal R minimising ||B - A R||_F (rows of A are matched to rows of B)."""
+    U, _, Vt = torch.linalg.svd(A.t() @ B)
+    return U @ Vt
+
+
+def _align_pair(state_i, state0, cfg, iters=4):
+    """Match donor-i rows to donor-0 rows, refining the hidden gauge with the
+    tentative row correspondence (breaks the gauge/permutation chicken-and-egg).
+    Returns an assignment (donor-i row j -> donor-0 row)."""
+    toki, tok0 = state_i["tok.weight"], state0["tok.weight"]
+    R = _gauge_R(state_i, state0, cfg)                       # interior-based seed
+    assign = assign_from_similarity((_unit(toki) @ _unit(tok0 @ R).t()).numpy())
+    for _ in range(iters):
+        # re-estimate gauge from the matched embedding rows: tok0[assign] @ R ~ toki
+        R = _procrustes(tok0[assign], toki)
+        assign = assign_from_similarity((_unit(toki) @ _unit(tok0 @ R).t()).numpy())
+    return assign
+
+
+def recover_m3(zoo, i, cfg, n_bridge=3, iters=4):
+    """Multi-donor consensus on top of alternating refinement. Estimates donor i
+    -> donor 0 directly AND via several bridge donors j (compose i->j->0), then
+    votes the compositions into a score matrix and rounds with Hungarian."""
+    V = cfg.vocab
+    si, s0 = zoo[i]["A"], zoo[0]["A"]
+    score = torch.zeros(V, V)
+    direct = _align_pair(si, s0, cfg, iters)                 # i -> 0
+    score[torch.arange(V), torch.as_tensor(direct)] += 1.0
+    bridges = [j for j in range(1, len(zoo)) if j != i][:n_bridge]
+    for j in bridges:
+        a_ij = _align_pair(si, zoo[j]["A"], cfg, iters)       # i -> j
+        a_j0 = _align_pair(zoo[j]["A"], s0, cfg, iters)       # j -> 0
+        comp = torch.as_tensor(a_j0)[torch.as_tensor(a_ij)]   # i -> 0 via j
+        score[torch.arange(V), comp] += 1.0
+    return torch.tensor(assign_from_similarity(score.numpy()))
+
+
 # --------------------------- M2: graph-matching QAP -------------------------
 def _perm_mat(col, V):
     S = torch.zeros(V, V, dtype=torch.double)
@@ -117,7 +156,7 @@ def recover_all(zoo, cfg, methods=("m0", "m1", "m2")):
     perm0 = zoo[0]["perm"]
     tok0 = zoo[0]["A"]["tok.weight"]
     out = {m: [] for m in methods}
-    for z in zoo:
+    for i, z in enumerate(zoo):
         si = z["A"]
         true = true_map(z["perm"], perm0)
         if "m0" in methods:
@@ -127,6 +166,8 @@ def recover_all(zoo, cfg, methods=("m0", "m1", "m2")):
         if "m2" in methods:
             warm = recover_m0(si["tok.weight"], tok0)   # graph-refine the emb guess
             out["m2"].append(_acc(recover_m2(si, zoo[0]["A"], init=warm), true))
+        if "m3" in methods:
+            out["m3"].append(_acc(recover_m3(zoo, i, cfg), true))
     return out
 
 
