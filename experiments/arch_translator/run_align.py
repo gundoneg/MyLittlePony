@@ -47,7 +47,7 @@ def main():
     cfg = Cfg(vocab=16, d_model=64, n_layer=1, n_head=4, ctx=32, d_ff=256)
     tasks = sample_tasks(args.n_train + args.n_held, cfg.vocab, seed=0)
     nt, chance = args.n_train, 1 / cfg.vocab
-    print(f"PHASE 3b — post-hoc alignment recovers transfer? | V={cfg.vocab} d={cfg.d_model} "
+    print(f"PHASE 3b/3c — post-hoc alignment ladder | V={cfg.vocab} d={cfg.d_model} "
           f"| {args.n_train}+{args.n_held} tasks | chance={chance:.1%}")
 
     tied = build_donor_zoo(cfg, tasks, args.donor_steps, tied=True, verbose=False)

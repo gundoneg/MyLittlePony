@@ -95,6 +95,59 @@ init give it nearly for free, and (b) for everyone else, align + translate + a f
 is a strong, cheap warm-start that vastly beats training the new architecture from
 scratch.
 
+## Phase 3c — can we improve the alignment to recover real zero-shot?
+
+Phase 3b used one orthogonal alignment and zero-shot stayed at chance. Here we climb
+a ladder of stronger alignment methods, guided by a diagnostic (`diag_align.py`).
+
+**Diagnostic first (sets expectations):**
+
+```
+1) which symmetry fits the cross-donor frame? (residual, lower = better)
+     rotation (Procrustes) : 0.608      signed-permutation : 1.150
+     -> independently-trained frames relate more like a ROTATION
+2) best-rotation residual, same-task vs different-task donors:
+     FULL pre-norm activations : same = 0.648   diff = 1.146 (~random)
+     embedding-only activations: same = 0.585   diff = 0.594
+```
+
+The deep residual — the part that carries the task-specific computation the translator
+needs — is alignable (0.65) only when donors **share computation** (same task); across
+different tasks it is essentially random (1.15). The embedding alone cannot tell the two
+cases apart. So we should *expect* post-hoc alignment of independent, different-task
+donors to hit a wall.
+
+**The ladder (zero-shot on independent, different-task donors):**
+
+```
+  regime                    zero-shot   warm@15
+  tied (anchor)                82.6%     100.0%
+  independent (raw)             5.9%      69.6%
+  independent (ortho)           5.6%      97.8%
+  independent (signperm)        5.7%      83.1%
+  independent (act)             7.3%      96.1%
+  (random init)                   -       12.2%      (chance = 6.2%)
+```
+
+Findings:
+
+1. **No alignment method recovers zero-shot** (all 5–7% ≈ chance) — exactly the wall the
+   diagnostic predicted. The signal the translator needs lives in the deep residual,
+   which is unalignable across donors that share no computation.
+2. **Signed-permutation (the architecture's *exact* symmetry) is not the best fit** —
+   rotation beats it (warm 98% vs 83%), because two independently-trained nets relate
+   empirically more like a rotation than a channel permutation. A nice reminder that the
+   exact symmetry group and the best *cross-model* alignment are different things.
+3. **Alignment still buys a better warm-start** (rotation/activation ~97% vs raw 70% vs
+   random 12%), consistent with phase 3b.
+
+**Answer to "how do we improve alignment quality?"** For fully-independent,
+different-task models you *cannot* push post-hoc alignment to zero-shot — the alignable
+signal requires shared computation. The real lever is to **create that shared
+computation** (a common base / shared pretraining), after which the deep residual aligns
+(same-task residual 0.65 vs 1.15) and zero-shot becomes reachable. Absent that,
+align + translate + a few steps (warm-start) is the practical tool.
+
 ## Honest caveats
 
 - Toy scale (V=16, 1 layer, synthetic task); ~0.91 is not a universal number. The
@@ -114,5 +167,6 @@ scratch.
 ```bash
 cd experiments/arch_translator
 python run_translate.py --n_train 24 --n_held 8 --donor_steps 300 --c_steps 600  # phase 3
-python run_align.py     --n_train 20 --n_held 8 --donor_steps 250 --c_steps 500  # phase 3b
+python diag_align.py                                                            # phase 3c diagnostic
+python run_align.py     --n_train 20 --n_held 8 --donor_steps 250 --c_steps 500  # phase 3b/3c ladder
 ```
