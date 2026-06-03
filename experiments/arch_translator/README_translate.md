@@ -52,6 +52,49 @@ This causally confirms the Phase 1–2 finding: weights carry transferable struc
 **only inside a shared coordinate system**. Given that frame, cross-architecture
 zero-shot weight translation is real.
 
+## Phase 3b — can the shared frame be recovered for an already-trained model?
+
+Phase 3 manufactured the shared frame for free (tied init). In practice you are
+handed a model A that already lives in its own arbitrary basis. Can we *recover* a
+common frame post hoc — no retraining — so the translator works?
+
+**Method (`align.py`):** pick a reference donor R; for each other donor estimate the
+orthogonal `Q` that rotates its frame onto R's, fit by Procrustes on a *task-agnostic,
+row-comparable* anchor — the input-token and positional embeddings (same token/position
+identities for every donor; no sigma). Then express everything the translator reads in
+R's frame. (The lag feature `S_pos` is already orthogonally invariant, so alignment is
+really about putting the *vocab* maps into one frame.)
+
+```
+  regime                  zero-shot   mismatched-A   warm@15
+  tied (anchor)              82.6%         3.1%       100.0%
+  independent (raw)           5.9%         5.8%        69.6%
+  independent (aligned)       5.6%         7.8%        97.8%
+  (random init)                 -            -         12.2%
+                                                  (chance = 6.2%)
+```
+
+Two honest findings:
+
+1. **Pure zero-shot is NOT recoverable by a best-fit orthogonal alignment.** Both raw
+   and aligned independent donors stay at chance zero-shot (5–6%). Independently-trained
+   networks do not share an *exact* linear frame — consistent with the mode-connectivity
+   literature (Git Re-Basin gets low-loss connectivity, not functional equivalence). A
+   free shared frame really only exists when models are *born* in one (the tied 82.6%).
+
+2. **As a warm-start, translation is very valuable — and alignment earns most of the
+   gap.** With only 15 fine-tune steps: random init reaches 12%, the *raw* translated
+   init already reaches 70% (the generated SSM interior + approximate vocab maps are a
+   good basin), and the *aligned* translated init reaches **97.8% ≈ the tied 100%**.
+   So `align → translate → a handful of steps` recovers nearly all of the performance,
+   for a fraction of from-scratch training.
+
+**Practical answer.** You generally cannot get *free* zero-shot transfer for an
+arbitrary pretrained A by aligning after the fact. But (a) models that share a base /
+init give it nearly for free, and (b) for everyone else, align + translate + a few steps
+is a strong, cheap warm-start that vastly beats training the new architecture from
+scratch.
+
 ## Honest caveats
 
 - Toy scale (V=16, 1 layer, synthetic task); ~0.91 is not a universal number. The
@@ -70,5 +113,6 @@ zero-shot weight translation is real.
 
 ```bash
 cd experiments/arch_translator
-python run_translate.py --n_train 24 --n_held 8 --donor_steps 300 --c_steps 600
+python run_translate.py --n_train 24 --n_held 8 --donor_steps 300 --c_steps 600  # phase 3
+python run_align.py     --n_train 20 --n_held 8 --donor_steps 250 --c_steps 500  # phase 3b
 ```
