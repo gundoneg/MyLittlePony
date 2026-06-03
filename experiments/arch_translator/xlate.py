@@ -106,6 +106,35 @@ def train_translator(cfg, zoo, steps=600, lr=3e-3, bs=64, tasks_per_step=8, seed
     return C, template
 
 
+def _acc_of(template, params, cfg, task, iters=8, bs=128, seed=55):
+    g = torch.Generator().manual_seed(seed)
+    a = 0.0
+    with torch.no_grad():
+        for _ in range(iters):
+            x, y = make_batch(task, bs, cfg.ctx, cfg.vocab, g)
+            a += task_accuracy(run_B(template, params, x), y)
+    return a / iters
+
+
+def warm_start_acc(template, init_params, cfg, task, steps=15, lr=3e-3, bs=64):
+    """Fine-tune B starting from init_params for a few steps; return task accuracy."""
+    params = {k: v.detach().clone().requires_grad_(True) for k, v in init_params.items()}
+    opt = torch.optim.AdamW(list(params.values()), lr=lr)
+    g = torch.Generator().manual_seed(321)
+    for _ in range(steps):
+        x, y = make_batch(task, bs, cfg.ctx, cfg.vocab, g)
+        loss = masked_ce(run_B(template, params, x), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    return _acc_of(template, params, cfg, task)
+
+
+def random_B_params(cfg, seed=0):
+    torch.manual_seed(seed)
+    return {k: v.detach().clone() for k, v in LM(cfg, "ssm").named_parameters()}
+
+
 @torch.no_grad()
 def eval_translator(C, template, cfg, held, mismatch=False, iters=8, bs=128):
     """Zero-shot task accuracy of B*=C(A*). If mismatch, feed each task the WRONG
