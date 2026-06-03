@@ -53,10 +53,14 @@ def main():
     tied = build_donor_zoo(cfg, tasks, args.donor_steps, tied=True, verbose=False)
     indep = build_donor_zoo(cfg, tasks, args.donor_steps, tied=False, verbose=False)
     ref = indep[0]["A"]                                  # reference frame = donor 0
-    indep_al = align_zoo(indep, ref)
+    probe_x = torch.randint(cfg.vocab, (64, cfg.ctx),
+                            generator=torch.Generator().manual_seed(7))
 
-    regimes = [("tied (anchor)", tied), ("independent (raw)", indep),
-               ("independent (aligned)", indep_al)]
+    regimes = [("tied (anchor)", tied), ("independent (raw)", indep)]
+    for method in ("ortho", "signperm", "act"):          # the alignment ladder
+        regimes.append((f"independent ({method})",
+                        align_zoo(indep, ref, method=method, cfg=cfg, probe_x=probe_x)))
+
     rows, rand = [], None
     for name, zoo in regimes:
         C, tmpl, zs, mm = zero_shot(cfg, zoo[:nt], zoo[nt:], args.c_steps)
@@ -64,10 +68,10 @@ def main():
         rand = wr if rand is None else rand     # random init is regime-independent
         rows.append((name, zs, mm, wt))
 
-    print(f"\n  regime                  zero-shot  mismatched-A  warm@{args.warm_steps}")
+    print(f"\n  regime                    zero-shot  mismatched-A  warm@{args.warm_steps}")
     for name, zs, mm, wt in rows:
-        print(f"  {name:22s}  {zs:>8.1%}  {mm:>11.1%}  {wt:>7.1%}")
-    print(f"  {'(random init)':22s}  {'-':>8s}  {'-':>11s}  {rand:>7.1%}")
+        print(f"  {name:24s}  {zs:>8.1%}  {mm:>11.1%}  {wt:>7.1%}")
+    print(f"  {'(random init)':24s}  {'-':>8s}  {'-':>11s}  {rand:>7.1%}")
 
     print(f"\n  read-out: if 'independent (aligned)' zero-shot jumps from ~chance back up,")
     print("  a shared frame can be RECOVERED post hoc for already-trained models; the gap")
