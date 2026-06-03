@@ -55,23 +55,19 @@ def main():
     ref = indep[0]["A"]                                  # reference frame = donor 0
     indep_al = align_zoo(indep, ref)
 
-    rows = []
-    # tied baseline
-    _, _, zs, mm = zero_shot(cfg, tied[:nt], tied[nt:], args.c_steps)
-    rows.append(("tied (anchor)", zs, mm, None, None))
-    # independent raw
-    _, _, zs, mm = zero_shot(cfg, indep[:nt], indep[nt:], args.c_steps)
-    rows.append(("independent (raw)", zs, mm, None, None))
-    # independent aligned (+ warm-start finisher)
-    C, tmpl, zs, mm = zero_shot(cfg, indep_al[:nt], indep_al[nt:], args.c_steps)
-    wt, wr = warm(C, tmpl, cfg, indep_al[nt:], steps=args.warm_steps)
-    rows.append(("independent (aligned)", zs, mm, wt, wr))
+    regimes = [("tied (anchor)", tied), ("independent (raw)", indep),
+               ("independent (aligned)", indep_al)]
+    rows, rand = [], None
+    for name, zoo in regimes:
+        C, tmpl, zs, mm = zero_shot(cfg, zoo[:nt], zoo[nt:], args.c_steps)
+        wt, wr = warm(C, tmpl, cfg, zoo[nt:], steps=args.warm_steps)
+        rand = wr if rand is None else rand     # random init is regime-independent
+        rows.append((name, zs, mm, wt))
 
-    print(f"\n  regime                  zero-shot  mismatched-A  warm@{args.warm_steps}  random@{args.warm_steps}")
-    for name, zs, mm, wt, wr in rows:
-        w = f"{wt:>7.1%}" if wt is not None else "      -"
-        r = f"{wr:>8.1%}" if wr is not None else "       -"
-        print(f"  {name:22s}  {zs:>8.1%}  {mm:>11.1%}  {w}  {r}")
+    print(f"\n  regime                  zero-shot  mismatched-A  warm@{args.warm_steps}")
+    for name, zs, mm, wt in rows:
+        print(f"  {name:22s}  {zs:>8.1%}  {mm:>11.1%}  {wt:>7.1%}")
+    print(f"  {'(random init)':22s}  {'-':>8s}  {'-':>11s}  {rand:>7.1%}")
 
     print(f"\n  read-out: if 'independent (aligned)' zero-shot jumps from ~chance back up,")
     print("  a shared frame can be RECOVERED post hoc for already-trained models; the gap")
