@@ -27,18 +27,31 @@ def batch_for(task, bs, cfg, g):
 
 
 # ------------------------- sigma-free positional feature -------------------------
-def s_pos_feature(state, cfg):
-    """S_pos = P (W_q^T W_k) P^T from donor A's layer-0 attention + pos embedding.
+def per_block_feature(state, cfg, l):
+    """S_pos = P (W_q^T W_k) P^T from donor A's BLOCK-l attention + pos embedding.
 
-    Carries the lag k (a ridge at column = row - k) and is independent of sigma.
+    For block 0 this is the clean lag-k ridge (column = row - k); for deeper blocks
+    it reads whatever positional structure that block computes on the residual stream.
+    Independent of sigma and of an orthogonal frame change (P (Wq^T Wk) P^T), so it
+    composes with the data_align gauge.
     """
     d = cfg.d_model
-    qkv = state["blocks.0.mix.qkv.weight"]            # (3d, d): rows = W_q | W_k | W_v
+    qkv = state[f"blocks.{l}.mix.qkv.weight"]         # (3d, d): rows = W_q | W_k | W_v
     Wq, Wk = qkv[:d], qkv[d:2 * d]                    # each (d, d), y = W x
     M_qk = Wq.t() @ Wk                                # (d, d)
     P = state["pos.weight"]                           # (ctx, d)
     S = P @ M_qk @ P.t()                              # (ctx, ctx)
     return S.reshape(-1)                              # (ctx*ctx,)
+
+
+def s_pos_feature(state, cfg):
+    """Layer-0 positional feature (the monolithic Translator's input)."""
+    return per_block_feature(state, cfg, 0)
+
+
+def _donor_n_layer(A_state):
+    """Read a donor's depth from its own state dict (block index prefixes)."""
+    return max(int(k.split(".")[1]) for k in A_state if k.startswith("blocks.")) + 1
 
 
 # ------------------------------- the translator -------------------------------
@@ -80,9 +93,94 @@ class Translator(nn.Module):
         return params
 
 
+# ---------------------- per-block weight-TIED hypernet C ----------------------
+class PerLayerTranslator(nn.Module):
+    """A single shared 'block translator' reused at EVERY depth.
+
+    Where Translator emits all L blocks' interior from one layer-0 code via one
+    monolithic M (interior x d_z) -- which decays with depth -- this generates each
+    SSM block l from a per-block feature of donor A's block l, through a SHARED
+    encoder and a SHARED M_block (one-block-interior x d_z). C's parameter count is
+    therefore INDEPENDENT of n_layer, which buys two things:
+      * per-layer specialisation (each block gets its own code z_l), and
+      * train-shallow / port-deep: emit() reads the donor's OWN depth from A_state,
+        so a C trained on L=2 donors applies unchanged to an L=8 donor.
+
+    Weight-tying is automatic: the same M_block leaf is matmul'd at every layer, so
+    its gradient accumulates over layers -- do NOT clone it per layer. norm.w is an
+    interior-but-GLOBAL parameter (one per network, not per block) and is generated
+    once as a shared parameter, outside M_block. sigma still rides the equivariant
+    vocab maps W_t/W_h/W_p, exactly as in Translator.
+    """
+    def __init__(self, cfg: Cfg, feat_mu, feat_sd, d_z=8, h=64, b_kind="ssm",
+                 depth_frac=False):
+        super().__init__()
+        self.cfg = cfg
+        self.depth_frac = depth_frac
+        d = cfg.d_model
+        ref = LM(cfg, b_kind)
+        self.b_params = dict(ref.named_parameters())   # shape templates (not registered)
+        self.block0_keys = [k for k in self.b_params if k.startswith("blocks.0.")]
+        theta_block = torch.cat([self.b_params[k].detach().reshape(-1)
+                                 for k in self.block0_keys])   # one block's interior
+        self.register_buffer("theta_block", theta_block)
+        self.register_buffer("feat_mu", feat_mu)
+        self.register_buffer("feat_sd", feat_sd)
+        # global interior parameter (final RMSNorm), shared across the whole net
+        self.norm_w = nn.Parameter(self.b_params["norm.w"].detach().clone())
+        # equivariant vocab maps (sigma rides through these)
+        self.W_t = nn.Parameter(torch.eye(d) + 0.01 * torch.randn(d, d))
+        self.W_h = nn.Parameter(torch.eye(d) + 0.01 * torch.randn(d, d))
+        self.W_p = nn.Parameter(torch.eye(d) + 0.01 * torch.randn(d, d))
+        # shared per-block hypernet: per-block feature (+ optional depth fraction) -> z_l
+        in_dim = feat_mu.numel() + (1 if depth_frac else 0)
+        self.enc = nn.Sequential(nn.Linear(in_dim, h), nn.SiLU(),
+                                 nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
+        self.M_block = nn.Parameter(0.01 * torch.randn(theta_block.numel(), d_z))
+
+    @staticmethod
+    def feat_stats(zoo, cfg):
+        return feat_stats_perlayer(zoo, cfg)
+
+    def emit(self, A_state):
+        """Full B param dict, with the donor's OWN depth (not self.cfg.n_layer)."""
+        L = _donor_n_layer(A_state)
+        params = {}
+        for l in range(L):
+            feat = (per_block_feature(A_state, self.cfg, l) - self.feat_mu) / self.feat_sd
+            if self.depth_frac:
+                frac = 0.0 if L == 1 else l / (L - 1)
+                feat = torch.cat([feat, feat.new_tensor([frac])])
+            z = self.enc(feat)
+            interior = self.theta_block + self.M_block @ z   # tied across layers
+            off = 0
+            for k in self.block0_keys:
+                n = self.b_params[k].numel()
+                tgt = k.replace("blocks.0.", f"blocks.{l}.", 1)
+                params[tgt] = interior[off:off + n].view_as(self.b_params[k])
+                off += n
+        params["norm.w"] = self.norm_w
+        params["tok.weight"] = A_state["tok.weight"] @ self.W_t
+        params["head.weight"] = A_state["head.weight"] @ self.W_h
+        params["pos.weight"] = A_state["pos.weight"] @ self.W_p
+        return params
+
+
 # ------------------------------- featurise zoo -------------------------------
 def feat_stats(zoo, cfg):
     F_ = torch.stack([s_pos_feature(z["A"], cfg) for z in zoo])
+    return F_.mean(0), F_.std(0) + 1e-6
+
+
+def feat_stats_perlayer(zoo, cfg):
+    """Pool the per-block feature over (donor, layer): the shared encoder sees that
+    union, so it must be normalised on it. Stats come from whatever depth the zoo is
+    (e.g. L=2 for the depth-transfer experiment)."""
+    feats = []
+    for z in zoo:
+        for l in range(_donor_n_layer(z["A"])):
+            feats.append(per_block_feature(z["A"], cfg, l))
+    F_ = torch.stack(feats)
     return F_.mean(0), F_.std(0) + 1e-6
 
 
@@ -92,10 +190,11 @@ def run_B(template, params, x):
 
 
 def train_translator(cfg, zoo, steps=600, lr=3e-3, bs=64, tasks_per_step=8, seed=0,
-                     b_kind="ssm"):
+                     b_kind="ssm", translator_cls=Translator, **tkw):
     torch.manual_seed(seed)
-    mu, sd = feat_stats(zoo, cfg)
-    C = Translator(cfg, mu, sd, b_kind=b_kind)
+    stats_fn = getattr(translator_cls, "feat_stats", None)   # PerLayerTranslator pools
+    mu, sd = stats_fn(zoo, cfg) if stats_fn else feat_stats(zoo, cfg)
+    C = translator_cls(cfg, mu, sd, b_kind=b_kind, **tkw)
     template = LM(cfg, b_kind)
     opt = torch.optim.AdamW(C.parameters(), lr=lr)
     g = torch.Generator().manual_seed(424242)
