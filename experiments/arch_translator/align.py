@@ -104,6 +104,62 @@ def align_activation(state, ref_state, cfg, probe_x, full=False):
     return _apply_cols(state, lambda W: W @ Q)
 
 
+# --- method 5: per-layer activation Procrustes (the "Q-A extracts the basis" method) ---
+def layer_activations(state, probe_x, cfg):
+    """Residual-stream activations captured at EVERY block boundary (input to each
+    block) plus the final pre-norm, concatenated over (layer, sample, position) into
+    one (M, d) matrix.
+
+    The residual stream is a SINGLE d-dim basis threaded through all layers, so each
+    extra layer adds more activation vectors constraining the same alignment Q ->
+    depth helps pin the basis rather than hurting it.
+    """
+    m = LM(cfg, "transformer")
+    m.load_state_dict(state)
+    m.eval()
+    snaps = {}
+    handles = [blk.register_forward_pre_hook(
+                   lambda mod, inp, i=i: snaps.__setitem__(i, inp[0]))
+               for i, blk in enumerate(m.blocks)]
+    handles.append(m.norm.register_forward_pre_hook(
+        lambda mod, inp: snaps.__setitem__(len(m.blocks), inp[0])))
+    with torch.no_grad():
+        m(probe_x)
+    for h in handles:
+        h.remove()
+    parts = [snaps[i].reshape(-1, cfg.d_model) for i in sorted(snaps)]
+    return torch.cat(parts, dim=0)                      # (snapshots * N * T, d)
+
+
+def data_align(state, ref_state, cfg, probe_x):
+    """Estimate one orthogonal Q from the per-layer residual activations on a shared
+    Q-A probe, then express the matrices the translator reads in the reference frame."""
+    Hi = layer_activations(state, probe_x, cfg)
+    Hr = layer_activations(ref_state, probe_x, cfg)
+    Q = procrustes(Hi, Hr)
+    return _apply_cols(state, lambda W: W @ Q)
+
+
+def method_Q(state, ref_state, cfg, probe_x, method):
+    """The orthogonal Q a given alignment METHOD actually chooses (for diagnostics)."""
+    if method == "raw":
+        return torch.eye(cfg.d_model)
+    if method == "weight":
+        return estimate_Q(state, ref_state)            # from 48 embedding rows
+    if method == "data":
+        return procrustes(layer_activations(state, probe_x, cfg),
+                          layer_activations(ref_state, probe_x, cfg))
+    raise ValueError(method)
+
+
+def frame_residual(state, ref_state, cfg, probe_x, Q):
+    """Normalised RMS of donor activations mapped by Q vs reference activations.
+    Measures how well THIS Q lines the two residual-stream frames up (lower=better)."""
+    Hi = layer_activations(state, probe_x, cfg)
+    Hr = layer_activations(ref_state, probe_x, cfg)
+    return ((Hi @ Q - Hr).pow(2).mean()).sqrt().item() / (Hr.std().item() + 1e-9)
+
+
 # --------------------------------- dispatcher ---------------------------------
 def align_one(state, ref_state, method="ortho", cfg=None, probe_x=None):
     if method == "ortho":
@@ -114,6 +170,10 @@ def align_one(state, ref_state, method="ortho", cfg=None, probe_x=None):
         return align_activation(state, ref_state, cfg, probe_x, full=False)
     if method == "act_full":
         return align_activation(state, ref_state, cfg, probe_x, full=True)
+    if method == "data":
+        return data_align(state, ref_state, cfg, probe_x)
+    if method == "raw":
+        return dict(state)
     raise ValueError(method)
 
 
