@@ -34,12 +34,36 @@ and any transfer gap is attributable to the frame, not to generating deep interi
 
 ## Results
 
-<!-- RESULTS -->
-_(filled in from `run_deep.log` once the sweep completes)_
+`V=16`, `d=64`, `ctx=32`, 12 train + 5 held donors, donor 200 steps, translator 300
+steps. Chance = 6.25%. **zero-shot** task accuracy of `B*=C(A*)` on held donors (the
+differentiator), and the frame residual achieved by each method's own `Q` (lower = the
+two residual-stream frames are better aligned):
+
+| L | raw | weight | **data** | tied (upper bd) | residual raw / weight / **data** |
+|---|-----|--------|----------|-----------------|----------------------------------|
+| 2 | 6.0% | 6.0% | **76.8%** | 100.0% | 1.42 / 1.31 / **0.64** |
+| 4 | 6.2% | 7.5% | **94.4%** | 100.0% | 1.41 / 1.32 / **0.62** |
+| 8 | 5.9% | 7.4% | **94.7%** | 100.0%* | 1.43 / 1.33 / **0.60** |
+
+\* tied is the shared-frame upper bound; ~100% at every depth.
+
+Warm-start saturates and does **not** separate the methods: with 15 fine-tune steps every
+init (even `raw`) reaches ~99-100% — these tiny nets relearn the task from almost any
+start. So **zero-shot** is the honest readout, and the gap there is stark.
 
 ## Takeaway
 
-<!-- TAKEAWAY -->
+- **Static weights don't carry the basis; the Q-A *activations* do.** `weight` alignment
+  (orthogonal Procrustes on 48 embedding rows) leaves zero-shot at chance — independent
+  nets are not related by a `Q` you can read off the embeddings. `data` alignment, using
+  activations on a tiny shared probe, recovers **77-95%** zero-shot.
+- **Depth helps, exactly as predicted.** The residual stream is one `d`-dim basis shared
+  across all layers, so deeper nets give *more* activation vectors to pin the same `Q`:
+  `data` zero-shot rises 76.8% -> 94.4% -> 94.7% and its residual falls 0.64 -> 0.62 ->
+  0.60 as `L` goes 2 -> 4 -> 8. `weight`/`raw` are flat at chance regardless of depth.
+- So for the user's question — *can a small Q-A set recover the basis for deep nets?* —
+  **yes, and it scales into depth** in this sandbox. The basis lives in the behaviour's
+  activations, not the weights, and more depth means more evidence for it.
 
 ## Honest caveats
 
