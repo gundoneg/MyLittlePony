@@ -46,3 +46,36 @@ def task_accuracy(logits, y):
     pred = logits.argmax(-1)
     valid = y != IGNORE
     return (pred[valid] == y[valid]).float().mean().item()
+
+
+# --------------------------- multi-task (M tasks per model) ---------------------------
+def sample_task_bundles(n, M, vocab, ks=(1, 2, 3), seed=0):
+    """n donors, each a LIST of M tasks the single model must solve in-context."""
+    g = torch.Generator().manual_seed(seed)
+    bundles = []
+    for _ in range(n):
+        b = []
+        for _ in range(M):
+            sigma = torch.randperm(vocab, generator=g)
+            k = int(ks[torch.randint(len(ks), (1,), generator=g)])
+            b.append(dict(sigma=sigma, k=k))
+        bundles.append(b)
+    return bundles
+
+
+def make_multitask_batch(tasks, bs, ctx, vocab, generator=None):
+    """One model, M tasks. Position 0 is a task selector token m in [0,M); the rest
+    is content. Target y_t = sigma_m(x_{t-k_m}) where t-k references content (>=1)."""
+    M = len(tasks)
+    m_list = torch.randint(M, (bs,), generator=generator)
+    x = torch.randint(vocab, (bs, ctx), generator=generator)
+    x[:, 0] = m_list                                   # in-context task selector
+    y = torch.full((bs, ctx), IGNORE, dtype=torch.long)
+    for j, t in enumerate(tasks):
+        rows = (m_list == j).nonzero(as_tuple=True)[0]
+        k = t["k"]
+        if len(rows) == 0 or ctx <= k + 1:
+            continue
+        cols = torch.arange(k + 1, ctx)                # valid target positions
+        y[rows.unsqueeze(1), cols.unsqueeze(0)] = t["sigma"][x[rows][:, 1:ctx - k]]
+    return x, y

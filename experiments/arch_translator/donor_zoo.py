@@ -10,9 +10,17 @@ import time
 import torch
 
 from models import Cfg, LM
-from task import sample_tasks, make_batch, masked_ce, task_accuracy
+from task import (sample_tasks, make_batch, make_multitask_batch,
+                  masked_ce, task_accuracy)
 
 TIED_SEED = 1234
+
+
+def batch_for(task, bs, ctx, vocab, g):
+    """Dispatch: a single task (dict) or a multi-task bundle (list of dicts)."""
+    if isinstance(task, list):
+        return make_multitask_batch(task, bs, ctx, vocab, g)
+    return make_batch(task, bs, ctx, vocab, g)
 
 
 def train_donor(cfg, task, steps, init_seed, bs=64, lr=3e-3):
@@ -22,7 +30,7 @@ def train_donor(cfg, task, steps, init_seed, bs=64, lr=3e-3):
     g = torch.Generator().manual_seed(7000 + init_seed)
     A.train()
     for _ in range(steps):
-        x, y = make_batch(task, bs, cfg.ctx, cfg.vocab, g)
+        x, y = batch_for(task, bs, cfg.ctx, cfg.vocab, g)
         logits, _ = A(x)
         loss = masked_ce(logits, y)
         opt.zero_grad()
@@ -37,7 +45,7 @@ def donor_acc(A, cfg, task, iters=8, bs=128):
     g = torch.Generator().manual_seed(99)
     acc = 0.0
     for _ in range(iters):
-        x, y = make_batch(task, bs, cfg.ctx, cfg.vocab, g)
+        x, y = batch_for(task, bs, cfg.ctx, cfg.vocab, g)
         acc += task_accuracy(A(x)[0], y)
     return acc / iters
 

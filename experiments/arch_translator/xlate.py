@@ -14,9 +14,16 @@ import torch.nn as nn
 from torch.func import functional_call
 
 from models import Cfg, LM
-from task import make_batch, masked_ce, task_accuracy
+from task import make_batch, make_multitask_batch, masked_ce, task_accuracy
 
 VOCAB_KEYS = ("tok.weight", "pos.weight", "head.weight")
+
+
+def batch_for(task, bs, cfg, g):
+    """Single task (dict) or multi-task bundle (list of dicts)."""
+    if isinstance(task, list):
+        return make_multitask_batch(task, bs, cfg.ctx, cfg.vocab, g)
+    return make_batch(task, bs, cfg.ctx, cfg.vocab, g)
 
 
 # ------------------------- sigma-free positional feature -------------------------
@@ -36,12 +43,12 @@ def s_pos_feature(state, cfg):
 
 # ------------------------------- the translator -------------------------------
 class Translator(nn.Module):
-    def __init__(self, cfg: Cfg, feat_mu, feat_sd, d_z=8, h=64):
+    def __init__(self, cfg: Cfg, feat_mu, feat_sd, d_z=8, h=64, b_kind="ssm"):
         super().__init__()
         self.cfg = cfg
         d = cfg.d_model
         # reference B: gives the interior init th0 and the exact param spec
-        ref = LM(cfg, "ssm")
+        ref = LM(cfg, b_kind)
         self.b_params = dict(ref.named_parameters())
         self.int_keys = [k for k in self.b_params if k not in VOCAB_KEYS]
         th0 = torch.cat([self.b_params[k].detach().reshape(-1) for k in self.int_keys])
@@ -84,11 +91,12 @@ def run_B(template, params, x):
     return functional_call(template, params, (x,))[0]
 
 
-def train_translator(cfg, zoo, steps=600, lr=3e-3, bs=64, tasks_per_step=8, seed=0):
+def train_translator(cfg, zoo, steps=600, lr=3e-3, bs=64, tasks_per_step=8, seed=0,
+                     b_kind="ssm"):
     torch.manual_seed(seed)
     mu, sd = feat_stats(zoo, cfg)
-    C = Translator(cfg, mu, sd)
-    template = LM(cfg, "ssm")
+    C = Translator(cfg, mu, sd, b_kind=b_kind)
+    template = LM(cfg, b_kind)
     opt = torch.optim.AdamW(C.parameters(), lr=lr)
     g = torch.Generator().manual_seed(424242)
     C.train()
@@ -99,7 +107,7 @@ def train_translator(cfg, zoo, steps=600, lr=3e-3, bs=64, tasks_per_step=8, seed
         for i in idx:
             z = zoo[int(i)]
             params = C.emit(z["A"])
-            x, y = make_batch(z["task"], bs, cfg.ctx, cfg.vocab, g)
+            x, y = batch_for(z["task"], bs, cfg, g)
             loss = loss + masked_ce(run_B(template, params, x), y)
         (loss / len(idx)).backward()
         opt.step()
@@ -111,28 +119,45 @@ def _acc_of(template, params, cfg, task, iters=8, bs=128, seed=55):
     a = 0.0
     with torch.no_grad():
         for _ in range(iters):
-            x, y = make_batch(task, bs, cfg.ctx, cfg.vocab, g)
+            x, y = batch_for(task, bs, cfg, g)
             a += task_accuracy(run_B(template, params, x), y)
     return a / iters
 
 
 def warm_start_acc(template, init_params, cfg, task, steps=15, lr=3e-3, bs=64):
     """Fine-tune B starting from init_params for a few steps; return task accuracy."""
+    return warm_curve(template, init_params, cfg, task, max_steps=steps,
+                      every=steps, lr=lr, bs=bs)[steps]
+
+
+def warm_curve(template, init_params, cfg, task, max_steps=40, every=4, lr=3e-3, bs=64):
+    """Fine-tune B from init_params; return {step: accuracy} at 0, every, ..., max_steps."""
     params = {k: v.detach().clone().requires_grad_(True) for k, v in init_params.items()}
     opt = torch.optim.AdamW(list(params.values()), lr=lr)
     g = torch.Generator().manual_seed(321)
-    for _ in range(steps):
-        x, y = make_batch(task, bs, cfg.ctx, cfg.vocab, g)
+    curve = {0: _acc_of(template, params, cfg, task)}
+    for step in range(1, max_steps + 1):
+        x, y = batch_for(task, bs, cfg, g)
         loss = masked_ce(run_B(template, params, x), y)
         opt.zero_grad()
         loss.backward()
         opt.step()
-    return _acc_of(template, params, cfg, task)
+        if step % every == 0 or step == max_steps:
+            curve[step] = _acc_of(template, params, cfg, task)
+    return curve
 
 
-def random_B_params(cfg, seed=0):
+def steps_to_threshold(curve, thr=0.9, cap=None):
+    """First fine-tune step whose accuracy >= thr (else `cap`)."""
+    for s in sorted(curve):
+        if curve[s] >= thr:
+            return s
+    return cap if cap is not None else max(curve) + 1
+
+
+def random_B_params(cfg, seed=0, b_kind="ssm"):
     torch.manual_seed(seed)
-    return {k: v.detach().clone() for k, v in LM(cfg, "ssm").named_parameters()}
+    return {k: v.detach().clone() for k, v in LM(cfg, b_kind).named_parameters()}
 
 
 @torch.no_grad()
@@ -147,7 +172,7 @@ def eval_translator(C, template, cfg, held, mismatch=False, iters=8, bs=128):
         params = C.emit(src["A"])
         a = 0.0
         for _ in range(iters):
-            x, y = make_batch(z["task"], bs, cfg.ctx, cfg.vocab, g)
+            x, y = batch_for(z["task"], bs, cfg, g)
             a += task_accuracy(run_B(template, params, x), y)
         accs.append(a / iters)
     return sum(accs) / len(accs)
