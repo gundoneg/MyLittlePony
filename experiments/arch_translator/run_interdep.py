@@ -54,8 +54,8 @@ def diverse_tasks(n, cfg, L, alpha, seed):
     return tasks
 
 
-def train_eval(cfg_tr, train_zoo, cfg_d, target, warm, frac=True):
-    C, _ = train_translator(cfg_tr, train_zoo, steps=350, tasks_per_step=6,
+def train_eval(cfg_tr, train_zoo, cfg_d, target, warm, c_steps, frac=True):
+    C, _ = train_translator(cfg_tr, train_zoo, steps=c_steps, tasks_per_step=6,
                             translator_cls=PerLayerTranslator, depth_frac=frac)
     return evaluate(C, LM(cfg_d, "ssm"), cfg_d, target, warm_at=warm)
 
@@ -69,6 +69,7 @@ def main():
     ap.add_argument("--n_train", type=int, default=10)
     ap.add_argument("--n_held", type=int, default=4)
     ap.add_argument("--donor_steps", type=int, default=0)
+    ap.add_argument("--c_steps", type=int, default=350)
     ap.add_argument("--warm", type=int, default=15)
     ap.add_argument("--realistic", action="store_true", default=True)
     ap.add_argument("--tied", dest="realistic", action="store_false")
@@ -95,9 +96,9 @@ def main():
 
         cnm, cnw = nn_reconstruction_coverage(narrow, d_target, cfg_d)
         cdm, cdw = nn_reconstruction_coverage(diverse, d_target, cfg_d)
-        zs_n = train_eval(cfg_s, narrow, cfg_d, d_target, args.warm)[0]
-        zs_d = train_eval(cfg_s, diverse, cfg_d, d_target, args.warm)[0]
-        zs_nat = train_eval(cfg_d, d_native, cfg_d, d_target, args.warm)[0]
+        zs_n = train_eval(cfg_s, narrow, cfg_d, d_target, args.warm, args.c_steps)[0]
+        zs_d = train_eval(cfg_s, diverse, cfg_d, d_target, args.warm, args.c_steps)[0]
+        zs_nat = train_eval(cfg_d, d_native, cfg_d, d_target, args.warm, args.c_steps)[0]
 
         abl = ",".join(f"{d:.0%}" for d in drops)
         print(f"{a:>6.2f} | {abl:>22} | n {cnm:.2f}/{cnw:.2f}  d {cdm:.2f}/{cdw:.2f} | "
