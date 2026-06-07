@@ -41,12 +41,44 @@ def sample_tasks_hops(n, vocab, hops, maxjump=4, seed=0):
             for _ in range(n)]
 
 
+def sample_tasks_interdep(n, vocab, depth, alpha, maxjump=2, seed=0):
+    """Layer-interdependence knob (phase 8). Branch-routed pointer chase of length
+    `depth`; each hop is CONTINUE (recursive: hop from the running pointer -> adds
+    required depth) with prob `alpha`, else RESET (parallelisable: jump to an anchor
+    that is a function of the ORIGINAL position/token only -> computable from the
+    layer-0 input, adds no depth). alpha=1 == pure pointer-chase (all layers needed,
+    Phase-A regime); alpha=0 == depth not required (deep blocks idle). alpha sweeps the
+    required recursion depth, hence whether a shallow donor can EXHIBIT the deep types.
+    The branch is a deterministic function of the original token + hop index, so it is
+    observable to the donor. Returns dict(sigma, interdep=depth, alpha, maxjump)."""
+    g = torch.Generator().manual_seed(seed)
+    return [dict(sigma=torch.randperm(vocab, generator=g),
+                 interdep=depth, alpha=float(alpha), maxjump=maxjump)
+            for _ in range(n)]
+
+
 def make_batch(task, bs, ctx, vocab, generator=None):
     """(x, y). Dispatches on task type:
       * (sigma,k):    y_t = sigma(x_{t-k}),                 y_t=IGNORE for t<k
       * pointer-hops: y_t = sigma(x[p_m(t)]),  p_0=t,  p_{j+1}=p_j-1-(x_{p_j} mod J),
                       clamped at 0; y_t=IGNORE for t<hops (chain not yet meaningful).
+      * interdep:     branch-routed chase; per hop CONTINUE (recursive) w.p. alpha else
+                      RESET to anchor(t) (parallelisable). y_t=sigma(x[p_m(t)]).
     """
+    if "interdep" in task:
+        sigma, m, alpha, J = task["sigma"], task["interdep"], task["alpha"], task["maxjump"]
+        x = torch.randint(vocab, (bs, ctx), generator=generator)
+        t = torch.arange(ctx)
+        cont_addr = (t - ((x % J) + 1)).clamp(min=0)        # CONTINUE: hop from current ptr
+        anchor = (t - 1 - (x % J)).clamp(min=0)             # RESET: fn of original (t, x_t) only
+        p = t.expand(bs, ctx).clone()
+        for j in range(m):
+            h = ((x.long() * 2654435761 + j * 40503) % 1000).float() / 1000.0  # observable ~U[0,1)
+            cont = h < alpha                                # P(continue)~alpha per (pos, hop)
+            p = torch.where(cont, cont_addr.gather(1, p), anchor)
+        y = sigma[torch.gather(x, 1, p)]
+        y[:, :m] = IGNORE
+        return x, y
     if "hops" in task:
         sigma, hops, J = task["sigma"], task["hops"], task["maxjump"]
         x = torch.randint(vocab, (bs, ctx), generator=generator)
