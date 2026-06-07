@@ -24,6 +24,8 @@ class Cfg:
     ctx: int = 64
     d_ff: int = 256
     conv_w: int = 4          # B's short causal depthwise conv width
+    bidirectional: bool = False   # if True, Attention drops the causal mask
+                                  # (diffusion-port adaptation; default keeps AR behavior)
 
 
 class RMSNorm(nn.Module):
@@ -53,6 +55,9 @@ class Attention(nn.Module):
         self.nh, self.hd = c.n_head, c.d_model // c.n_head
         self.qkv = nn.Linear(c.d_model, 3 * c.d_model)
         self.o = nn.Linear(c.d_model, c.d_model)
+        # Instance flag (not a forward-arg) so existing positional callers of
+        # `mix(x)` stay untouched. Default causal == original AR numerics.
+        self.causal = not c.bidirectional
 
     def forward(self, x):
         B, T, D = x.shape
@@ -61,8 +66,10 @@ class Attention(nn.Module):
         k = k.view(B, T, self.nh, self.hd).transpose(1, 2)
         v = v.view(B, T, self.nh, self.hd).transpose(1, 2)
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.hd)
-        mask = torch.triu(torch.full((T, T), float("-inf"), device=x.device), 1)
-        att = (att + mask).softmax(-1)
+        if self.causal:
+            mask = torch.triu(torch.full((T, T), float("-inf"), device=x.device), 1)
+            att = att + mask
+        att = att.softmax(-1)
         y = (att @ v).transpose(1, 2).reshape(B, T, D)
         return self.o(y)
 
