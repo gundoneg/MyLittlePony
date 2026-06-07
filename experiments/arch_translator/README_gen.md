@@ -86,7 +86,35 @@ design's unique payoff. `depth_frac` conditions each block on a normalised depth
 fraction so middle layers of a deeper net interpolate between the training-depth
 endpoints (absolute layer index would not generalise).
 
-_(results appended below when the run completes)_
+| trained on L=2 → | L=2 (native) zs/warm/s90 | L=3 transfer zs/warm/s90 (native zs) | L=4 transfer zs/warm/s90 (native zs) |
+|---|---|---|---|
+| feat-only | 16.7% / 97.5% / 10 | 8.3% / 25.5% / 35 (20.0%) | 6.3% / 28.1% / 35 (20.4%) |
+| feat+depthfrac | 14.2% / 92.7% / 16 | 8.2% / 24.2% / 35 (16.2%) | 5.7% / 10.3% / 35 (26.5%) |
+
+Chance = 6.2%.
+
+**Depth-transfer fails — and the reason is the real lesson.** A per-block translator
+trained only on L=2 donors transfers to deeper donors at **near-chance zero-shot**
+(8%/6%) with weak warm-start (24–28%), far below the native-trained ceiling (~20%).
+Normalised-depth conditioning (`depth_frac`) does **not** rescue it.
+
+Why: pointer-chasing makes **each layer do a *distinct* job** (hop 1, hop 2, …). The
+3rd/4th hop's block transformation simply does not appear in the L=2 training
+distribution, so a shared `M_block`/encoder fitted on 2-hop structure cannot
+synthesize it. This is the flip side of EXP-1's idle-block confound: the only regime
+where the old `(σ,k)` depth-transfer *looked* successful (phase-4: L=2→L=4 zero-shot
+14% > native 9%) was precisely the degenerate one — transferring "do-nothing" deep
+blocks is trivial.
+
+**Conclusion (the prerequisite for going to big models).** A weight-translator can be
+trained *at* a given depth and then gives a real practical edge (warm-start,
+convergence — EXP 1). But **zero-shot depth-transfer requires the per-layer
+computation to be repeated/shared across layers** (a universal-transformer / weight-
+tied stack), not depth-specialised. You cannot train `C` shallow and expect it to
+generalise to a much deeper real model whose layers each do different work — you must
+either train `C` at (or near) the target depth, or restrict the claim to models with
+tied/repeated layers. This is the honest gate to clear before pointing `C` at a deep
+pretrained model.
 
 ## Honest caveats
 
