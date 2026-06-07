@@ -32,11 +32,13 @@ def steps_for(L, override=0):
 def make_zoo(L, n, seed, realistic, donor_steps=0, maxjump=2):
     cfg = cfg_at(L)
     tasks = sample_tasks_hops(n, cfg.vocab, hops=L, maxjump=maxjump, seed=seed)
-    zoo = build_donor_zoo(cfg, tasks, steps=steps_for(L, donor_steps), tied=not realistic, verbose=False)
+    raw = build_donor_zoo(cfg, tasks, steps=steps_for(L, donor_steps), tied=not realistic, verbose=False)
     if realistic:                                  # data-align to donor 0 (phase 5)
         probe = probe_inputs(tasks[0], cfg, 64)
-        zoo = align_zoo(zoo, zoo[0]["A"], "data", cfg=cfg, probe_x=probe)
-    return cfg, zoo
+        aligned = align_zoo(raw, raw[0]["A"], "data", cfg=cfg, probe_x=probe)
+    else:
+        aligned = raw
+    return cfg, raw, aligned                        # raw kept for runnable layer-ablation
 
 
 def main():
@@ -60,18 +62,19 @@ def main():
           f"({'realistic indep+align' if args.realistic else 'tied'})   chance {CHANCE:.1%}")
     print("=" * 72)
 
-    cfg_s, shallow = make_zoo(args.shallow, args.n_train + args.n_held, seed=7,
-                              realistic=args.realistic, donor_steps=args.donor_steps)
+    cfg_s, _, shallow = make_zoo(args.shallow, args.n_train + args.n_held, seed=7,
+                                 realistic=args.realistic, donor_steps=args.donor_steps)
     s_train, s_held = shallow[:args.n_train], shallow[args.n_train:]
-    cfg_d, deep = make_zoo(args.deep, args.n_train + args.n_held, seed=200,
-                           realistic=args.realistic, donor_steps=args.donor_steps)
+    cfg_d, deep_raw, deep = make_zoo(args.deep, args.n_train + args.n_held, seed=200,
+                                     realistic=args.realistic, donor_steps=args.donor_steps)
     d_native, d_target = deep[:args.n_train], deep[args.n_train:]
     print(f"  donor-acc: shallow L{args.shallow} {sum(z['acc'] for z in shallow)/len(shallow):.0%} | "
           f"deep L{args.deep} {sum(z['acc'] for z in deep)/len(deep):.0%}")
 
-    # depth genuinely used in the deep target?
-    drops = layer_ablation(d_target, cfg_d)
-    print(f"  deep-target layer-ablation drop/blk {[f'{d:.0%}' for d in drops]}")
+    # depth genuinely used in the deep target? (measure on RAW, runnable donors --
+    # data-aligned states are not a valid runnable transformer, so ablation must use raw)
+    drops = layer_ablation(deep_raw[args.n_train:], cfg_d)
+    print(f"  deep-target layer-ablation drop/blk {[f'{d:.0%}' for d in drops]} (on raw donors)")
 
     # coverage of deep-target per-block features by the shallow TRAIN zoo
     cov_mean, cov_min = nn_reconstruction_coverage(s_train, d_target, cfg_d)
