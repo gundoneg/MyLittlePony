@@ -25,8 +25,39 @@ def sample_tasks(n, vocab, ks=(1, 2, 3), seed=0):
     return tasks
 
 
+def sample_tasks_hops(n, vocab, hops, maxjump=4, seed=0):
+    """Depth-demanding pointer-chasing tasks. Each = dict(sigma=perm, hops=m, maxjump).
+
+    Why: the (sigma,k) task is a single gather -- one attention layer solves it at any
+    lag, so deeper donors leave their deep blocks idle (layer-ablation ~0% drop) and
+    those un-pinned deep weights are un-translatable. Pointer-chasing forces depth:
+    each position holds a backward jump; following the chain m times needs ~m
+    sequential gathers, i.e. ~m layers (one attention layer = one hop). sigma is still
+    visible in the embedding/head, so the translator's vocab-equivariant part stays
+    meaningful. The pointer rule is fixed; only sigma and chain depth vary.
+    """
+    g = torch.Generator().manual_seed(seed)
+    return [dict(sigma=torch.randperm(vocab, generator=g), hops=hops, maxjump=maxjump)
+            for _ in range(n)]
+
+
 def make_batch(task, bs, ctx, vocab, generator=None):
-    """(x, y) with y_t = sigma(x_{t-k}); y_t = IGNORE for t < k."""
+    """(x, y). Dispatches on task type:
+      * (sigma,k):    y_t = sigma(x_{t-k}),                 y_t=IGNORE for t<k
+      * pointer-hops: y_t = sigma(x[p_m(t)]),  p_0=t,  p_{j+1}=p_j-1-(x_{p_j} mod J),
+                      clamped at 0; y_t=IGNORE for t<hops (chain not yet meaningful).
+    """
+    if "hops" in task:
+        sigma, hops, J = task["sigma"], task["hops"], task["maxjump"]
+        x = torch.randint(vocab, (bs, ctx), generator=generator)
+        jump = (x % J) + 1                                  # backward jump 1..J
+        addr = (torch.arange(ctx) - jump).clamp(min=0)      # each pos -> a past pos
+        p = torch.arange(ctx).expand(bs, ctx).clone()
+        for _ in range(hops):
+            p = torch.gather(addr, 1, p)                    # one backward hop
+        y = sigma[torch.gather(x, 1, p)]
+        y[:, :hops] = IGNORE                                # warm-up positions
+        return x, y
     sigma, k = task["sigma"], task["k"]
     x = torch.randint(vocab, (bs, ctx), generator=generator)
     y = torch.full((bs, ctx), IGNORE, dtype=torch.long)

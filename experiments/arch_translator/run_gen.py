@@ -30,7 +30,7 @@ import time
 import torch
 
 from models import Cfg, LM
-from task import sample_tasks, make_batch, task_accuracy
+from task import sample_tasks, sample_tasks_hops, make_batch, task_accuracy
 from donor_zoo import build_donor_zoo
 from align import align_zoo
 from xlate import (Translator, PerLayerTranslator, train_translator, eval_translator,
@@ -41,6 +41,21 @@ CHANCE = 1 / 16
 
 def cfg_at(L):
     return Cfg(vocab=16, d_model=64, n_layer=L, n_head=4, ctx=32, d_ff=256)
+
+
+def make_tasks(N, cfg, L, args, seed):
+    """Sample N tasks for depth L. The 'hops' task is depth-demanding (chain length
+    = depth), so deep blocks are exercised; (sigma,k) is the original single-gather."""
+    if getattr(args, "task", "sigmak") == "hops":
+        return sample_tasks_hops(N, cfg.vocab, hops=L, maxjump=args.maxjump, seed=seed)
+    return sample_tasks(N, cfg.vocab, seed=seed)
+
+
+def donor_steps_for(L, args):
+    """Pointer chains of length L need more training the deeper they get."""
+    if getattr(args, "task", "sigmak") == "hops":
+        return max(args.donor_steps, 400 * L)
+    return args.donor_steps
 
 
 def probe_inputs(task, cfg, n, seed=12345):
@@ -111,8 +126,8 @@ def exp1_isolation(depths, args):
     for L in depths:
         cfg = cfg_at(L)
         N = args.n_train + args.n_held
-        tasks = sample_tasks(N, cfg.vocab, seed=100 + L)
-        zoo = build_donor_zoo(cfg, tasks, steps=args.donor_steps, tied=True, verbose=False)
+        tasks = make_tasks(N, cfg, L, args, seed=100 + L)
+        zoo = build_donor_zoo(cfg, tasks, steps=donor_steps_for(L, args), tied=True, verbose=False)
         dm = sum(z["acc"] for z in zoo) / N
         train, held = zoo[:args.n_train], zoo[args.n_train:]
         row = {"donor": dm}
@@ -138,8 +153,8 @@ def exp2_depth_transfer(args):
     print("=" * 72)
     cfg_s = cfg_at(args.train_depth)
     N = args.n_train + args.n_held
-    train_zoo = build_donor_zoo(cfg_s, sample_tasks(args.n_train, cfg_s.vocab, seed=7),
-                                steps=args.donor_steps, tied=True, verbose=False)
+    train_zoo = build_donor_zoo(cfg_s, make_tasks(args.n_train, cfg_s, args.train_depth, args, seed=7),
+                                steps=donor_steps_for(args.train_depth, args), tied=True, verbose=False)
     print(f"  trained one perlayer C on {args.n_train} donors at L={args.train_depth} "
           f"(donor-acc {sum(z['acc'] for z in train_zoo)/len(train_zoo):.0%})")
     # depth_frac=True: condition on a NORMALISED depth fraction so middle layers of deep
@@ -152,15 +167,15 @@ def exp2_depth_transfer(args):
         print(f"  [{tag}]")
         for L in [args.train_depth] + [d for d in args.deep if d != args.train_depth]:
             cfg_d = cfg_at(L)
-            held = build_donor_zoo(cfg_d, sample_tasks(args.n_held, cfg_d.vocab, seed=200 + L),
-                                   steps=args.donor_steps, tied=True, verbose=False)
+            held = build_donor_zoo(cfg_d, make_tasks(args.n_held, cfg_d, L, args, seed=200 + L),
+                                   steps=donor_steps_for(L, args), tied=True, verbose=False)
             tmpl_d = LM(cfg_d, "ssm")
             zs, wm, s90 = evaluate(C, tmpl_d, cfg_d, held, warm_at=args.warm)
             # native ceiling: a perlayer C trained AT this depth on its own donors
             ntag = ""
             if args.native_ceiling and L != args.train_depth:
-                ntrain = build_donor_zoo(cfg_d, sample_tasks(args.n_train, cfg_d.vocab, seed=300 + L),
-                                         steps=args.donor_steps, tied=True, verbose=False)
+                ntrain = build_donor_zoo(cfg_d, make_tasks(args.n_train, cfg_d, L, args, seed=300 + L),
+                                         steps=donor_steps_for(L, args), tied=True, verbose=False)
                 Cn, tn = train_translator(cfg_d, ntrain, steps=args.c_steps,
                                           tasks_per_step=args.tps,
                                           translator_cls=PerLayerTranslator, depth_frac=use_frac)
@@ -180,10 +195,10 @@ def exp3_realistic(depths, args):
     print("=" * 72)
     for L in depths:
         cfg = cfg_at(L)
-        task = sample_tasks(1, cfg.vocab, seed=L)[0]          # one shared task per depth
+        task = make_tasks(1, cfg, L, args, seed=L)[0]          # one shared task per depth
         N = args.n_train + args.n_held
         probe_x = probe_inputs(task, cfg, args.n_probe)
-        zoo = build_donor_zoo(cfg, [task] * N, steps=args.donor_steps, tied=False, verbose=False)
+        zoo = build_donor_zoo(cfg, [task] * N, steps=donor_steps_for(L, args), tied=False, verbose=False)
         dm = sum(z["acc"] for z in zoo) / N
         ref = zoo[0]["A"]
         aligned = align_zoo(zoo, ref, "data", cfg=cfg, probe_x=probe_x)
@@ -200,6 +215,9 @@ def exp3_realistic(depths, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", default="1", help="1 | 2 | 3 | all")
+    ap.add_argument("--task", default="sigmak", choices=["sigmak", "hops"],
+                    help="sigmak: one-gather (deep blocks idle); hops: depth-demanding")
+    ap.add_argument("--maxjump", type=int, default=2, help="hops: backward jump range")
     ap.add_argument("--depths", default="1,2,4,8")
     ap.add_argument("--deep", default="4,6,8", help="exp2 transfer targets")
     ap.add_argument("--train_depth", type=int, default=2, help="exp2 training depth")
