@@ -69,7 +69,22 @@ exercise — the recipe core is verified here; only the HF wiring is Kaggle-only
 
 `python experiments/diffusion_port/toy_adapt.py` adapts the toy transformer on
 char-level Shakespeare with the full recipe (annealing + masked-diffusion + a
-clean held-out eval at fixed t) and prints denoised samples.
+clean held-out eval at fixed t) and prints denoised samples. A 3000-step CPU run
+(1M-param model) gives:
+
+- held-out masked-CE drops well below the unigram bound (ln 65 = 4.17): it now
+  **differentiates by corruption** — t=0.5 → 2.06, t=0.7 → 2.56, t=0.9 → 3.08 —
+  proving the model genuinely uses bidirectional context (a flat curve early on
+  was an under-training artifact);
+- **reconstruction** of an 18%-corrupted real line: **~59% masked-char accuracy**
+  (random 1.5%), e.g. `Nay, by _aint Jamy, I h_l_ __u a_pe_ny` →
+  `Nay, by faint Jamy, I hall you appeany`;
+- from-scratch generation produces word-like English at this toy scale.
+
+**Stability note:** the 1/t ELBO weight blows up for tiny t; on small batches a
+single t≈0 sequence spikes the gradient and stalls training near the unigram
+bound. The toy driver caps it with `sample_mask_rate(eps=0.05)` + grad-norm
+clipping. Large-batch / bf16 / grad-clip Kaggle runs absorb this naturally.
 
 ## Running on Kaggle (the real port)
 
