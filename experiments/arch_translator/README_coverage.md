@@ -57,11 +57,51 @@ What Phase A does **not** test: whether a **diverse** shallow zoo can manufactur
 and how that depends on how recursive (vs parallelisable) the task's depth is. That is
 Phase B.
 
-## Phase B — layer-interdependence knob (in progress)
+## Phase B — layer-interdependence sweep (`run_interdep.py`)
 A pointer-chase with a per-hop **continue** (recursive, adds required depth) vs **reset**
-(parallelisable, computable from the layer-0 input) branch, mixed by `alpha = P(continue)`:
-`alpha=1` = pure recursion (Phase-A regime), `alpha=0` = depth not required. Sweep `alpha`,
-train `C` on **narrow** vs **diverse** shallow zoos, apply to a deep target, and correlate
-zero-shot with the measured coverage to locate the boundary `alpha*` where shallow coverage
-stops sufficing. Confirms the hypothesis if diverse-shallow reaches the native ceiling for
-`alpha < alpha*` while narrow stays at chance, with coverage tracking the transition.
+(parallelisable, computable from the layer-0 input) branch, mixed by `alpha = P(continue)`.
+Calibration confirms the knob: per-layer ablation rises with `alpha` (L=4 layer-0 30→64%,
+layer-1 7→50%, layer-2 5→28%; the 4th layer stays idle at d=64, so the sweep uses deep=3).
+Per `alpha`: train `C` on a **narrow** (uniform maxjump=2) vs a **diverse** (varied
+maxjump) shallow L=2 zoo, zero-shot to a deep L=3 target; report measured coverage, the
+native-depth ceiling, and the deep-target depth-usage (raw-donor ablation).
+
+**Result (shallow L2 → deep L3, indep+align):**
+
+| alpha | deep-ablation | cov narrow w/c | cov div w/c | zs narrow | zs diverse | zs native |
+|---|---|---|---|---|---|---|
+| 0.00 | `33,23,1` | 0.04 | 0.02 | 14.8% | 7.0% | **99.8%** |
+| 0.25 | `32,35,3` | 0.03 | 0.02 | 12.5% | 6.4% | 98.2% |
+| 0.50 | `53,25,4` | 0.05 | 0.03 | 6.3% | 5.4% | 97.8% |
+| 0.75 | `53,17,22` | 0.03 | 0.03 | 7.2% | 6.0% | 95.0% |
+| 1.00 | `54,31,77` | 0.06 | 0.03 | 7.2% | 5.2% | **95.1%** |
+
+(chance 6.2%; "w/c" = worst-case NN cosine; depth-usage rises with alpha as designed.)
+
+**Conclusion — the hypothesis is refuted, but the lens is right.**
+- The **native-depth ceiling is 95–100% at every alpha**: the deep target is perfectly
+  translatable when `C` is trained at its depth.
+- **Shallow→deep transfer fails across the entire interdependence range**, and a
+  varied-maxjump **diverse zoo does not help** (diverse ≈ narrow ≈ chance; its coverage is
+  not higher). Worst-case coverage is near-zero everywhere and predicts the failure.
+- **The mechanism is deeper than "unseen deep types".** Transfer fails even at `alpha=0`,
+  where the deep target barely uses its depth (ablation `33,23,1`) and solves essentially
+  the same near-shallow task — narrow still gives only 14.8% vs native 99.8%. So the cause
+  is **depth-entanglement**: donors **co-adapt their layers to the total depth**, so the
+  *same* task is decomposed across layers differently at L=2 vs L=3, and the per-block
+  feature distributions structurally do not overlap across depths. A shallow zoo cannot
+  manufacture coverage because the obstacle is not a missing task-type but the depth-
+  dependent way computation is split across blocks.
+
+**What this settles (the path to big models).** The user's coverage *lens* is correct and
+the metric works — but for these tasks coverage cannot be created from shallow donors. This
+robustly confirms phase 6's conclusion: **train `C` at (or near) the target depth**;
+zero-shot depth extrapolation is not viable for the per-block translator. The remaining
+escape hatch is targets with **tied/repeated layers** (universal-transformer style), where
+the per-layer decomposition is depth-invariant by construction so coverage is automatic.
+
+**Limitations.** "Diversity" here was only varied maxjump — a weak lever orthogonal to the
+depth-decomposition obstacle. A stronger per-role diversity was not tried; but the `alpha=0`
+same-task failure strongly suggests no shallow diversity can overcome depth-entanglement.
+Toy width caps usable depth at ~3 (the 4th layer never engages at d=64); the mechanism is
+portable, the absolute numbers are not.
