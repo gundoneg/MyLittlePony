@@ -94,7 +94,10 @@ def main():
 
     for step in range(1, args.steps + 1):
         x0 = get_x0(data, "train", args.bs, args.ctx, g)
-        t = D.sample_mask_rate(args.bs, generator=g)
+        # eps>0.05 caps the 1/t ELBO weight at ~20x: without it, an occasional
+        # tiny-t sequence gets a ~1000x weight and its gradient spike destabilizes
+        # toy-scale training (real models absorb this with large batches + clip).
+        t = D.sample_mask_rate(args.bs, eps=0.05, generator=g)
         x_t, m = D.forward_mask(x0, t, mask_id, generator=g)
 
         # Mask annealing: with prob rho keep this batch causal (AR-like) early,
@@ -105,17 +108,67 @@ def main():
 
         logits = model(x_t)[0]
         loss = D.diffusion_loss(logits, x0, m, t)
-        opt.zero_grad(); loss.backward(); opt.step()
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
 
         if step % args.eval_every == 0 or step == 1:
             vce = eval_loss(model, data, mask_id, args.ctx)
             print(f"{step:>5} | {rho:>8.2f} | {loss.item():>9.3f} | {vce:>11.3f}")
 
-    # ---- qualitative denoising (bidirectional inference) ----
+    # ---- per-t eval: the model is far better at low corruption ----
     D.set_bidirectional(model, causal=False)
     model.eval()
-    print("-" * 56)
-    print("denoised samples (start = all [MASK], confidence unmasking):")
+    print("-" * 64)
+    print("held-out masked-CE by corruption level t (lower = better):")
+    for tv in (0.15, 0.3, 0.5, 0.7, 0.9):
+        print(f"  t={tv:.2f}  CE={eval_loss(model, data, mask_id, args.ctx, t_fixed=tv):.3f}")
+
+    # ---- reconstruction demo (the honest, achievable demo) ----
+    # Corrupt a real held-out line by ~18% and denoise it back; report the
+    # char-accuracy on the masked positions. This exercises bidirectional
+    # context far more meaningfully than generating from pure noise at toy scale.
+    print("-" * 64)
+    print("reconstruction: mask ~18% of a real val line, denoise, char-acc:")
+
+    def safe_decode(ids):
+        return "".join("_" if i == mask_id else data.itos[i] for i in ids)
+
+    def denoise_inplace(start):
+        """Confidence-unmask only the [MASK] positions of `start`, keeping the
+        known (visible) tokens frozen -- i.e. prompt = the whole visible line."""
+        rec = start.clone()
+        for s in range(args.gen_steps):
+            masked = rec == mask_id
+            if not masked.any():
+                break
+            lg = model(rec)[0]
+            lg[..., mask_id] = float("-inf")
+            pred = lg.argmax(-1)
+            conf = lg.softmax(-1).max(-1).values.masked_fill(~masked, -1.0)
+            k = max(1, int(masked.sum()) // max(1, args.gen_steps - s))
+            idx = conf.view(-1).topk(k).indices
+            rec.view(-1)[idx] = pred.view(-1)[idx]
+        return rec
+
+    g2 = torch.Generator().manual_seed(7)
+    accs = []
+    last = None
+    for _ in range(5):
+        x0 = get_x0(data, "val", 1, args.ctx, g2)
+        x_t, m = D.forward_mask(x0, torch.full((1,), 0.18), mask_id, generator=g2)
+        rec = denoise_inplace(x_t)
+        accs.append((rec[m] == x0[m]).float().mean().item())
+        last = (x0, x_t, rec)
+    x0, x_t, rec = last
+    print(f"  original : {safe_decode(x0[0].tolist())!r}")
+    print(f"  corrupted: {safe_decode(x_t[0].tolist())!r}")
+    print(f"  denoised : {safe_decode(rec[0].tolist())!r}")
+    print(f"  masked-char accuracy over 5 lines: {sum(accs)/len(accs):.1%} "
+          f"(random baseline {1/data.vocab:.1%})")
+
+    print("-" * 64)
+    print("from-scratch generation (all [MASK]) -- weak at this toy scale:")
     out = D.diffusion_generate(lambda ids: model(ids)[0], length=args.gen_len,
                                mask_id=mask_id, steps=args.gen_steps,
                                batch_size=3, temperature=args.gen_temp,
