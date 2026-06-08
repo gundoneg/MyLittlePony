@@ -62,6 +62,34 @@ early-layer types plus the redundant deep type — rather than match the full de
   Qwen3.5-0.8B via `transformers` (hidden-state capture + module-list skip/swap). Same
   expected profile: a few distinct early layers, a long redundant interchangeable interior.
 
+## Finale — type-coverage → depth transfer on the real target (`coverage.py`)
+Does the favorable phase-9 picture let a *small zoo of exemplars* reproduce the full-depth
+network (the user's scheme)? We test the crudest translator — verbatim **grafting** of an
+exemplar layer's weights into a slot (`llama_min.remap`) — on supra50m.
+
+- **Graft-cost matrix** `G[i,j]=KL(full ‖ slot i runs layer j)`: slot 0 is covered by
+  *nothing* (KL 5–8 from every source); slots 1,2 and the final slot 11 are semi-unique;
+  the interior 3–10 is mutually coverable (most `G[i,j]<0.5`). So ≈4 distinct types + a
+  redundant interior — as phase 9 predicted.
+- **But tiling fails — superadditively.** Copy the best single deep exemplar (layer 4) into
+  *all* interior slots 3–10, keep {0,1,2,11} exact: the **sum of independent single-graft
+  costs is 2.49**, yet the **joint end-to-end KL is 6.51** (≈2.6× worse). Greedy zoo
+  reconstruction of all 12 layers reaches only KL≈2.7 even with 6 exemplars, and a 4-type
+  reconstruction generates garbled text.
+
+**Refined conclusion.** Deep layers are *locally* interchangeable (drop one, swap two,
+substitute one — all cheap) but the model is **not tile-compressible**: small per-slot
+mismatches compound across depth, so copying a few exemplars into every slot derails the
+residual stream. Local interchangeability ≠ "the interior is k tiled prototypes."
+
+**What this means for the weight-translator `C`.** Verbatim coverage (a zoo copied in, no
+training) is *insufficient* — the per-slot **learned correction** that `C` supplies is
+exactly the missing ingredient, not an optional refinement. The good news from `G`: the
+correction each deep slot needs is *small* (single-graft costs <0.5), so a translator with
+even light per-slot adaptation has little distance to cover in the interior. The scheme is
+"cover the ~4 types **and** learn the small per-slot adapter," not "cover the types and
+copy." The depth barrier is lower than the phase-8 worst case but is not zero.
+
 ## Honest caveats
 - Inputs are self-generated (on-distribution but model-confident); absolute KL scales are
   probe-dependent — the **per-layer profile and the early-vs-deep contrast** are the signal,

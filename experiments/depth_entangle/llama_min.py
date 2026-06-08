@@ -70,9 +70,10 @@ class MinLlama:
         return x
 
     @torch.no_grad()
-    def forward(self, idx, skip=None, swap=None, capture=False):
-        """skip: layer index to bypass (identity). swap: (a,b) layer order swap.
-        capture=True -> also return list of residual streams (len L+1)."""
+    def forward(self, idx, skip=None, swap=None, capture=False, remap=None):
+        """skip: stack slot to bypass (identity). swap: (a,b) order swap.
+        remap: dict {slot -> source layer} -- run slot using another layer's weights
+        (graft, for the type-coverage experiment). capture=True also returns residuals."""
         B, T = idx.shape
         pos = torch.arange(T)
         x = self.embed[idx]
@@ -80,10 +81,11 @@ class MinLlama:
         if swap is not None:
             a, b = swap; order[a], order[b] = order[b], order[a]
         hs = [x]
-        for l in order:
-            if skip is not None and l == skip:
+        for slot in range(self.L):
+            if skip is not None and slot == skip:
                 hs.append(x); continue
-            x = self._block(x, l, pos)
+            src = remap.get(slot, order[slot]) if remap is not None else order[slot]
+            x = self._block(x, src, pos)
             hs.append(x)
         x = self._rms(x, self.w["model.norm.weight"])
         logits = x @ self.embed.T                             # tied head
