@@ -90,6 +90,38 @@ even light per-slot adaptation has little distance to cover in the interior. The
 "cover the ~4 types **and** learn the small per-slot adapter," not "cover the types and
 copy." The depth barrier is lower than the phase-8 worst case but is not zero.
 
+## Does a light learned adapter close the gap? (`adapter.py`) — prediction falsified
+The verbatim-graft finale left a hypothesis: single-graft costs <0.5 suggest each deep
+slot needs only a *small* correction, so a light per-slot adapter on **one shared exemplar**
+should recover the model. We tested it: interior slots 3–10 all share one frozen exemplar
+layer (L6) plus a trainable **rank-4 LoRA delta on every projection + a per-slot RMSNorm
+gain** (307K params), distilled to the full model's logits.
+
+| setup | step-0 (verbatim tile) | train-KL | held-out-KL | generation |
+|---|---|---|---|---|
+| light adapter, 4 seq | 6.85 | 0.05 | **3.88** | degenerate |
+| light adapter, 12 seq + weight-decay | 7.64 | 0.20 | **3.47** | degenerate |
+
+The adapter fits the *training* logits easily (KL→0.05 — capacity is ample) but **generalizes
+only to KL≈3.5**, closing barely half the verbatim gap (≈7→0), and the reconstruction still
+emits repetitive garbage. More data moved the held-out floor only 3.9→3.5.
+
+**Conclusion — the prediction is wrong, and instructively so.** Single-graft cheapness
+measured each interior layer's replaceability *with all other layers intact*; it does **not
+compose**. When all 8 interior slots are served by one exemplar at once, each adapter must
+also correct the compounded distribution shift from every *other* graft — so the required
+per-slot correction is large and high-rank, not the small low-rank tweak the local metric
+implied. The deep interior is locally interchangeable but encodes 8 genuinely **distinct**
+transformations; it is not "one type + a light adapter."
+
+**Net for the weight-translator.** Depth transfer cannot be cheated by tiling a covered
+exemplar even with a learned light adapter. Phase-9 redundancy buys *robustness*
+(drop/swap/substitute-one are cheap), not *compressibility* (tile-and-correct fails). The
+real-model regime sits between phase-8 worst case (no transfer) and naive optimism (a few
+types tile): a depth-D target needs per-slot translator capacity scaling with the number of
+distinct interior transformations, not a constant zoo. Local interchangeability ≠ low-rank-
+in-depth.
+
 ## Honest caveats
 - Inputs are self-generated (on-distribution but model-confident); absolute KL scales are
   probe-dependent — the **per-layer profile and the early-vs-deep contrast** are the signal,
