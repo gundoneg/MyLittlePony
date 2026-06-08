@@ -51,10 +51,13 @@ similarity **0.99** (the layers are almost the same "type").
   invariant by construction. The phase-8 negative result was the toy being maximally
   depth-entangled; real models sit near the favorable end.
 
-**Net for the project.** Depth-extrapolation of the weight-translator is blocked only when
-layers are genuinely unique per depth. Real LLMs are not: their deep interior is a repeated,
-interchangeable block. The practical recipe is *cover the type repertoire* — a handful of
-early-layer types plus the redundant deep type — rather than match the full depth.
+**Net for the project (this section's hypothesis — later refined below).** Depth-
+extrapolation looks blocked only when layers are unique per depth, and real LLMs' deep
+interior is locally interchangeable — suggesting "cover the type repertoire" instead of
+matching depth. **The three sections that follow test this and walk it back:** verbatim
+tiling fails superadditively, a light adapter on one exemplar fails too, and the interior
+turns out to hold ~6.7 *distinct* transformations (PR), so local interchangeability is
+robustness, not compressibility. Read on.
 
 ## Reproduce
 - Local (CPU, this repo): `python experiments/depth_entangle/entangle.py`.
@@ -121,6 +124,29 @@ real-model regime sits between phase-8 worst case (no transfer) and naive optimi
 types tile): a depth-D target needs per-slot translator capacity scaling with the number of
 distinct interior transformations, not a constant zoo. Local interchangeability ≠ low-rank-
 in-depth.
+
+## How many distinct transformations does the interior really hold? (`effrank.py`)
+Run every interior block on a **common** input (the stream entering slot 3), take each
+block's residual update `U_i = block_i(H) − H`, and measure the participation ratio
+(effective rank) of `{U_i}` — gauge-invariant, in function space.
+
+- Pairwise cosine of the update fields is **0.04–0.28** (near-orthogonal); only neighbours
+  9–10 reach 0.44.
+- **Participation ratio = 6.72 of 8** interior layers (top-1 component = 26% of energy).
+  Context: all 12 layers → PR 11.6/12; early 0–2 → PR 2.9/3.
+
+So the interior carries **~6.7 functionally distinct transformations**, not one repeated
+type. This *quantifies why the adapter failed*: a single shared exemplar captures only ~26%,
+and the rest is genuinely high-rank — no light per-slot tweak can synthesize it.
+
+**Reconciling with "redundant/interchangeable" above.** The phase-9 drop/swap/single-graft
+results are real but mean *robustness*, not *copies*: each layer's update is **small**
+relative to the residual stream (update-ratio ~0.5) and **near-orthogonal** to the others.
+Removing or reordering one small, distinct increment perturbs the stream only slightly (low
+KL) — but the increments are not substitutes for each other. Local interchangeability =
+"you can afford to lose any one small contribution," not "the contributions are the same."
+The deep interior is an **ensemble of ~N small, nearly-orthogonal refinements**: robust to
+single perturbations, yet high-rank and therefore incompressible in depth.
 
 ## Honest caveats
 - Inputs are self-generated (on-distribution but model-confident); absolute KL scales are
