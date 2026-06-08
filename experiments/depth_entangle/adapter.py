@@ -11,14 +11,17 @@ each of the 7 projections + a per-slot RMSNorm gain. Train (Adam) to distill the
 model's logits (KL). delta init 0 => step 0 == verbatim tile (~6.5). Report train+held-out
 KL vs verbatim (6.5) and exact (0).
 """
-import torch, torch.nn.functional as F
+import os, torch, torch.nn.functional as F
 from llama_min import MinLlama, load_vocab, decode
 
 PROJ = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
         "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
 EXEMPLAR = 6
 INTERIOR = list(range(3, 11))
-RANK = 4
+RANK = int(os.environ.get("RANK", 4))
+NSEQ = int(os.environ.get("NSEQ", 4))
+STEPS = int(os.environ.get("STEPS", 250))
+WD = float(os.environ.get("WD", 0.0))
 
 
 class Recon:
@@ -95,18 +98,18 @@ if __name__ == "__main__":
     m = MinLlama()
     inv = load_vocab()
     gen = lambda s, n=128: torch.cat([m.generate(torch.tensor([[1]]), n, temperature=0.9)[:, 1:] for _ in range(s)], 0)
-    train = gen(4); torch.manual_seed(2); heldout = gen(3)
+    train = gen(NSEQ); torch.manual_seed(2); heldout = gen(3)
     tgt_tr = m.forward(train).detach()
     tgt_ho = m.forward(heldout).detach()
     print(f"adapter test: exemplar=L{EXEMPLAR} -> interior {INTERIOR}, rank={RANK}, "
-          f"{sum(p.numel() for p in Recon(m).params)} trainable params\n")
+          f"nseq={NSEQ} wd={WD}, {sum(p.numel() for p in Recon(m).params)} trainable params\n")
 
     r = Recon(m)
-    opt = torch.optim.Adam(r.params, lr=3e-3)
+    opt = torch.optim.Adam(r.params, lr=3e-3, weight_decay=WD)
     with torch.no_grad():
         k0 = klmean(tgt_tr, r.logits(train)).item()
     print(f"  step   0  (verbatim tile)   train-KL {k0:6.3f}   [exact=0.0]")
-    for step in range(1, 251):
+    for step in range(1, STEPS + 1):
         opt.zero_grad()
         loss = klmean(tgt_tr, r.logits(train))
         loss.backward(); opt.step()
