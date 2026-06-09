@@ -14,7 +14,7 @@ repl = {
     r"N_SEQS   = 120": "N_SEQS   = 6",
     r"SEQ_LEN  = 128": "SEQ_LEN  = 32",
     r"FIT_STEPS = 300": "FIT_STEPS = 5",
-    r"INTERIOR = list\(range\(2, m\.L - 1\)\)": "INTERIOR = [3, 4]",
+    r"INTERIOR = list\(range\(3, m\.L - 1\)\)": "INTERIOR = [3, 4]",
 }
 for k, v in repl.items():
     src, n = re.subn(k, v, src)

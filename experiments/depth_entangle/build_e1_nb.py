@@ -33,10 +33,10 @@ cells.append(md(
 "ceiling, cascade fit (error-correcting), exemplar choice.",
 "",
 "**Setup.** Just enable a **GPU** accelerator + **Internet** and Run All — the notebook",
-"**auto-downloads a real published Llama-family LLM** (`HuggingFaceTB/SmolLM2-135M`, ungated)",
-"via `huggingface_hub`. No `transformers` needed (a minimal CUDA Llama forward is inlined; it is",
-"config-driven, so it also loads `supra50m` or any standard Llama checkpoint if you instead add",
-"one as a Kaggle dataset). Interior slots / exemplar are derived from the model's depth.",
+"**auto-downloads the exact phase-9 model** (`SupraLabs/Supra-50M-Instruct`, a 12-layer",
+"Llama, == local supra50m) via `huggingface_hub`. No `transformers` needed (a minimal CUDA",
+"Llama forward is inlined; it is config-driven, so it also loads any standard Llama checkpoint",
+"-- set `MODEL_ID` or add one as a Kaggle dataset). Exemplar/interior are derived from depth.",
 ))
 
 cells.append(code(
@@ -46,7 +46,7 @@ cells.append(code(
 "DEV = 'cuda' if torch.cuda.is_available() else 'cpu'",
 "torch.manual_seed(0)",
 "",
-"MODEL_ID = 'HuggingFaceTB/SmolLM2-135M'   # auto-downloaded from HF if no local checkpoint",
+"MODEL_ID = 'SupraLabs/Supra-50M-Instruct'   # the exact phase-9 model (== local supra50m)",
 "",
 "def resolve_model():",
 "    \"\"\"1) env CKPT_DIR (CPU smoke), 2) a Kaggle dataset, 3) download MODEL_ID from HF.\"\"\"",
@@ -136,8 +136,8 @@ cells.append(code(
 "        return idx",
 "",
 "m = MinLlama(MODEL_DIR)",
-"EXEMPLAR = m.L // 2                  # shared exemplar = a middle layer",
-"INTERIOR = list(range(2, m.L - 1))   # interior band (skip the first two + the last)",
+"EXEMPLAR = m.L // 2                  # shared exemplar = a middle layer (L6 for supra50m)",
+"INTERIOR = list(range(3, m.L - 1))   # redundant interior (phase-9: slots 3..10 for L=12)",
 "print(f'loaded: L={m.L} d={m.d} H={m.H}/{m.KV} vocab={m.vocab}  tied_head={m.head is m.embed}')",
 "print(f'exemplar=L{EXEMPLAR}  interior slots {INTERIOR[0]}..{INTERIOR[-1]} ({len(INTERIOR)})')",
 ))
