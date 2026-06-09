@@ -21,7 +21,18 @@ from models import LM
 from xlate import VOCAB_KEYS  # noqa: F401  (kept for reference of what C reads)
 
 ANCHOR_KEYS = ("tok.weight", "pos.weight")   # task-agnostic, row-comparable
-ROTATE_KEYS = ("tok.weight", "pos.weight", "head.weight", "blocks.0.mix.qkv.weight")
+# Frame-side rotation must hit EVERY block's qkv, not just block 0 -- otherwise
+# per_block_feature S = P (Wq^T Wk) P^T loses its gauge-invariance for l>=1 (a per-donor
+# random Q stays sandwiched). pos/qkv read the residual stream in ONE shared basis, so the
+# single data_align Q applies to all of them. (Phase-10/E0 fix; L=1 donors are unaffected.)
+_STATIC_ROTATE = ("tok.weight", "pos.weight", "head.weight")
+
+
+def rotate_keys(state):
+    """tok/pos/head plus every block's qkv present in this state dict."""
+    qkv = sorted(k for k in state
+                 if k.startswith("blocks.") and k.endswith(".mix.qkv.weight"))
+    return list(_STATIC_ROTATE) + qkv
 
 
 def procrustes(src, ref):
@@ -41,7 +52,7 @@ def gauge_align(state, ref_state):
     the translator reads are rotated; the rest is untouched/unused)."""
     Q = estimate_Q(state, ref_state)
     out = dict(state)
-    for k in ROTATE_KEYS:
+    for k in rotate_keys(state):
         out[k] = state[k] @ Q          # input/frame-side rotation (columns = residual dim)
     return out
 
@@ -49,7 +60,7 @@ def gauge_align(state, ref_state):
 def _apply_cols(state, op):
     """Return a copy with `op` applied to the residual (column) dim of read matrices."""
     out = dict(state)
-    for k in ROTATE_KEYS:
+    for k in rotate_keys(state):
         out[k] = op(state[k])
     return out
 

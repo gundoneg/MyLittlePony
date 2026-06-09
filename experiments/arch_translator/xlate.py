@@ -44,6 +44,20 @@ def per_block_feature(state, cfg, l):
     return S.reshape(-1)                              # (ctx*ctx,)
 
 
+def block_feat_repr(state, cfg, l, scale_free=False):
+    """Per-block feature for the encoder. scale_free decouples DIRECTION from SCALE:
+    deep blocks have systematically larger |feature| (e.g. 700 at l=0 vs 1185 at l=2),
+    so standardising the raw vector with a shallow zoo's stats sends the deepest layer
+    OOD. Unit-normalising the ctx^2 vector and passing log|feature| as a single extra
+    scalar turns that depth-correlated magnitude shift into a 1-D mild extrapolation
+    instead of a whole-vector distribution shift. (Phase-10/E0 Fix C.)"""
+    f = per_block_feature(state, cfg, l)
+    if scale_free:
+        n = f.norm()
+        return f / (n + 1e-9), torch.log(n + 1e-9)
+    return f, None
+
+
 def s_pos_feature(state, cfg):
     """Layer-0 positional feature (the monolithic Translator's input)."""
     return per_block_feature(state, cfg, 0)
@@ -113,10 +127,11 @@ class PerLayerTranslator(nn.Module):
     vocab maps W_t/W_h/W_p, exactly as in Translator.
     """
     def __init__(self, cfg: Cfg, feat_mu, feat_sd, d_z=8, h=64, b_kind="ssm",
-                 depth_frac=False):
+                 depth_frac=False, scale_free=False):
         super().__init__()
         self.cfg = cfg
         self.depth_frac = depth_frac
+        self.scale_free = scale_free
         d = cfg.d_model
         ref = LM(cfg, b_kind)
         self.b_params = dict(ref.named_parameters())   # shape templates (not registered)
@@ -132,22 +147,26 @@ class PerLayerTranslator(nn.Module):
         self.W_t = nn.Parameter(torch.eye(d) + 0.01 * torch.randn(d, d))
         self.W_h = nn.Parameter(torch.eye(d) + 0.01 * torch.randn(d, d))
         self.W_p = nn.Parameter(torch.eye(d) + 0.01 * torch.randn(d, d))
-        # shared per-block hypernet: per-block feature (+ optional depth fraction) -> z_l
-        in_dim = feat_mu.numel() + (1 if depth_frac else 0)
+        # shared per-block hypernet: per-block feature (+ log-norm if scale_free,
+        # + optional depth fraction) -> z_l
+        in_dim = feat_mu.numel() + (1 if scale_free else 0) + (1 if depth_frac else 0)
         self.enc = nn.Sequential(nn.Linear(in_dim, h), nn.SiLU(),
                                  nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
         self.M_block = nn.Parameter(0.01 * torch.randn(theta_block.numel(), d_z))
 
     @staticmethod
-    def feat_stats(zoo, cfg):
-        return feat_stats_perlayer(zoo, cfg)
+    def feat_stats(zoo, cfg, scale_free=False):
+        return feat_stats_perlayer(zoo, cfg, scale_free=scale_free)
 
     def emit(self, A_state):
         """Full B param dict, with the donor's OWN depth (not self.cfg.n_layer)."""
         L = _donor_n_layer(A_state)
         params = {}
         for l in range(L):
-            feat = (per_block_feature(A_state, self.cfg, l) - self.feat_mu) / self.feat_sd
+            f, logn = block_feat_repr(A_state, self.cfg, l, self.scale_free)
+            feat = (f - self.feat_mu) / self.feat_sd
+            if self.scale_free:
+                feat = torch.cat([feat, logn.reshape(1)])
             if self.depth_frac:
                 frac = 0.0 if L == 1 else l / (L - 1)
                 feat = torch.cat([feat, feat.new_tensor([frac])])
@@ -172,14 +191,15 @@ def feat_stats(zoo, cfg):
     return F_.mean(0), F_.std(0) + 1e-6
 
 
-def feat_stats_perlayer(zoo, cfg):
+def feat_stats_perlayer(zoo, cfg, scale_free=False):
     """Pool the per-block feature over (donor, layer): the shared encoder sees that
     union, so it must be normalised on it. Stats come from whatever depth the zoo is
-    (e.g. L=2 for the depth-transfer experiment)."""
+    (e.g. L=2 for the depth-transfer experiment). With scale_free, stats are over the
+    unit-normalised DIRECTION (the log-norm scalar is appended separately, not here)."""
     feats = []
     for z in zoo:
         for l in range(_donor_n_layer(z["A"])):
-            feats.append(per_block_feature(z["A"], cfg, l))
+            feats.append(block_feat_repr(z["A"], cfg, l, scale_free)[0])
     F_ = torch.stack(feats)
     return F_.mean(0), F_.std(0) + 1e-6
 
@@ -193,7 +213,11 @@ def train_translator(cfg, zoo, steps=600, lr=3e-3, bs=64, tasks_per_step=8, seed
                      b_kind="ssm", translator_cls=Translator, **tkw):
     torch.manual_seed(seed)
     stats_fn = getattr(translator_cls, "feat_stats", None)   # PerLayerTranslator pools
-    mu, sd = stats_fn(zoo, cfg) if stats_fn else feat_stats(zoo, cfg)
+    if stats_fn:
+        skw = {"scale_free": tkw["scale_free"]} if "scale_free" in tkw else {}
+        mu, sd = stats_fn(zoo, cfg, **skw)
+    else:
+        mu, sd = feat_stats(zoo, cfg)
     C = translator_cls(cfg, mu, sd, b_kind=b_kind, **tkw)
     template = LM(cfg, b_kind)
     opt = torch.optim.AdamW(C.parameters(), lr=lr)
