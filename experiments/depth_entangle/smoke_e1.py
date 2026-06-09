@@ -8,14 +8,13 @@ LOCAL = os.path.join(HERE, "..", "shakespeare_port", "models", "supra50m")
 nb = json.load(open(os.path.join(HERE, "e1_kaggle.ipynb")))
 src = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code")
 
+os.environ["CKPT_DIR"] = LOCAL              # resolve_model() picks this up (no HF download)
 repl = {
-    r"MODEL_DIR = os\.path\.dirname\(CANDS\[0\]\) if CANDS else 'supra50m'":
-        f"MODEL_DIR = {LOCAL!r}",
+    r"RANKS    = \[0, 1, 4, 16, 64\]": "RANKS    = [0, 4]",
     r"N_SEQS   = 120": "N_SEQS   = 6",
     r"SEQ_LEN  = 128": "SEQ_LEN  = 32",
-    r"RANKS    = \[0, 1, 4, 16, 64\]": "RANKS    = [0, 4]",
-    r"FIT_STEPS = 400": "FIT_STEPS = 5",
-    r"INTERIOR = list\(range\(3, 11\)\)": "INTERIOR = list(range(3, 5))",
+    r"FIT_STEPS = 300": "FIT_STEPS = 5",
+    r"INTERIOR = list\(range\(2, m\.L - 1\)\)": "INTERIOR = [3, 4]",
 }
 for k, v in repl.items():
     src, n = re.subn(k, v, src)
