@@ -36,13 +36,22 @@ CHANCE = 1 / 16
 QKV = lambda k: k.startswith("blocks.") and k.endswith(".mix.qkv.weight")
 
 
-def align_all_to_ref(raw_zoo, cfg, ref_resid, probe):
-    """Fix B: each donor -> common reference frame via full-residual Procrustes."""
-    out = []
-    for z in raw_zoo:
-        Q = procrustes(residual_activations(z["A"], probe, cfg), ref_resid)
-        out.append(dict(task=z["task"], A=_apply_cols(z["A"], lambda W: W @ Q), acc=z["acc"]))
-    return out
+def _rotate(zoo, Q):
+    return [dict(task=z["task"], A=_apply_cols(z["A"], lambda W: W @ Q), acc=z["acc"]) for z in zoo]
+
+
+def common_frame(s_raw, d_raw, cfg_s, cfg_d, probe_s, probe_d):
+    """Fix B v2: keep the STRONG per-depth data_align (within each depth, layer_activations)
+    for frame quality, then add ONE global bridge that rotates the deep reference's frame
+    onto the shallow reference's, so both depths share the shallow[0] frame for the
+    equivariant vocab maps. The bridge is a full-residual Procrustes on a shared probe
+    (depth-independent, spans all d). data_align(zoo, zoo[0]) leaves zoo[0] unchanged, so
+    the deep reference frame == d_raw[0]'s raw frame before the bridge."""
+    s = align_zoo(s_raw, s_raw[0]["A"], "data", cfg=cfg_s, probe_x=probe_s)
+    d = align_zoo(d_raw, d_raw[0]["A"], "data", cfg=cfg_d, probe_x=probe_d)
+    Qb = procrustes(residual_activations(d_raw[0]["A"], probe_s, cfg_d),
+                    residual_activations(s_raw[0]["A"], probe_s, cfg_s))
+    return s, _rotate(d, Qb)
 
 
 def feat_mismatch_zoo(zoo):
@@ -89,9 +98,7 @@ def run_alpha(a, args):
                                     tasks_per_step=6, translator_cls=PerLayerTranslator, depth_frac=True)
         old_t = zs(C_old, cfg_d, d_old[args.n_train:])
         cov_old = nn_reconstruction_coverage(s_old[:args.n_train], d_old[args.n_train:], cfg_d)
-        ref_resid = residual_activations(s_raw[0]["A"], probe_s, cfg_s)
-        s_fix = align_all_to_ref(s_raw, cfg_s, ref_resid, probe_s)
-        d_fix = align_all_to_ref(d_raw, cfg_d, ref_resid, probe_s)
+        s_fix, d_fix = common_frame(s_raw, d_raw, cfg_s, cfg_d, probe_s, probe_d)
 
     cov_fix = nn_reconstruction_coverage(s_fix[:args.n_train], d_fix[args.n_train:], cfg_d)
     C_fix, _ = train_translator(cfg_s, s_fix[:args.n_train], steps=args.c_steps, tasks_per_step=6, **tkw)
