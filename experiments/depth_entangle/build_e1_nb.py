@@ -40,7 +40,9 @@ cells.append(md(
 ))
 
 cells.append(code(
-"import os, glob, math, torch, torch.nn.functional as F",
+"import os",
+"os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')",
+"import glob, math, torch, torch.nn.functional as F",
 "from safetensors.torch import load_file",
 "",
 "DEV = 'cuda' if torch.cuda.is_available() else 'cpu'",
@@ -62,7 +64,8 @@ cells.append(code(
 "RANKS    = [0, 1, 4, 16, 64]  # 0 = gains-only floor; 'full' refit added separately",
 "N_SEQS   = 120                # teacher-forcing probe sequences (varied temperature)",
 "SEQ_LEN  = 128",
-"FIT_STEPS = 300",
+"FIT_STEPS = 500",
+"EVAL_SEQS = 24                # small subset for end-to-end KL (bounds GPU memory)",
 "print('device', DEV, '| model', MODEL_DIR)",
 ))
 
@@ -157,9 +160,11 @@ cells.append(code(
 "    for _ in range(N_SEQS // 3):",
 "        seqs.append(m.generate(torch.tensor([[1]], device=DEV), SEQ_LEN, temperature=t)[:, 1:])",
 "idx = torch.cat(seqs, 0)",
-"full_logits, HS = m.forward(idx, capture=True)   # HS[l] = input to block l ; HS[l+1] = its output",
-"full_logits = full_logits.detach()",
-"print('probe:', tuple(idx.shape), '| hidden states:', len(HS))",
+"_, HS = m.forward(idx, capture=True)             # keep hidden states for fitting; drop big logits",
+"HS = [h.detach() for h in HS]                    # HS[l] = input to block l ; HS[l+1] = its output",
+"EVAL = idx[:EVAL_SEQS]                            # small subset for end-to-end KL",
+"full_eval = m.forward(EVAL).detach()",
+"print('probe:', tuple(idx.shape), '| eval subset:', tuple(EVAL.shape), '| hidden states:', len(HS))",
 ))
 
 cells.append(code(
@@ -236,23 +241,27 @@ cells.append(code(
 
 cells.append(code(
 "# ---- COMPOSE fitted adapters into the full model -> end-to-end KL (the real test) ----",
-"def kl(p, q):",
-"    lp, lq = p.log_softmax(-1), q.log_softmax(-1)",
-"    return (lp.exp() * (lp - lq)).sum(-1).mean().item()",
+"def kl(p, q, chunk=2048):                         # chunked over tokens -> bounded memory",
+"    p2, q2 = p.reshape(-1, p.shape[-1]), q.reshape(-1, q.shape[-1])",
+"    tot, n = 0.0, p2.shape[0]",
+"    for i in range(0, n, chunk):",
+"        lp = p2[i:i+chunk].log_softmax(-1); lq = q2[i:i+chunk].log_softmax(-1)",
+"        tot += (lp.exp() * (lp - lq)).sum(-1).sum().item()",
+"    return tot / n",
 "",
 "def compose_kl(rank_key):",
 "    sel = {i: adapters[i][rank_key] for i in INTERIOR}",
 "    def slot_fn(l, x, pos):",
 "        return sel[l].apply(x, pos) if l in sel else m.block(x, l, pos)",
 "    with torch.no_grad():",
-"        lo = m.forward(idx, slot_fn=slot_fn)",
-"    return kl(full_logits, lo)",
+"        lo = m.forward(EVAL, slot_fn=slot_fn)",
+"    return kl(full_eval, lo)",
 "",
 "# verbatim baseline: exemplar copied into the interior, no adapter",
 "def verbatim_slot(l, x, pos): return m.block(x, EXEMPLAR, pos) if l in INTERIOR else m.block(x, l, pos)",
 "with torch.no_grad():",
-"    lo_v = m.forward(idx, slot_fn=verbatim_slot)",
-"print(f'verbatim tile (no adapter) end-to-end KL = {kl(full_logits, lo_v):.3f}   [exact=0]')",
+"    lo_v = m.forward(EVAL, slot_fn=verbatim_slot)",
+"print(f'verbatim tile (no adapter) end-to-end KL = {kl(full_eval, lo_v):.3f}   [exact=0]')",
 "for rk in RANKS + ['full']:",
 "    print(f'composed rank={str(rk):>4}: end-to-end KL = {compose_kl(rk):.3f}')",
 ))
@@ -277,15 +286,15 @@ cells.append(code(
 "    casc[i] = ad",
 "def casc_slot(l, x, pos): return casc[l].apply(x, pos) if l in casc else m.block(x, l, pos)",
 "with torch.no_grad():",
-"    lo_c = m.forward(idx, slot_fn=casc_slot)",
-"print(f'cascade-fit (rank {RK}) end-to-end KL = {kl(full_logits, lo_c):.3f}')",
+"    lo_c = m.forward(EVAL, slot_fn=casc_slot)",
+"print(f'cascade-fit (rank {RK}) end-to-end KL = {kl(full_eval, lo_c):.3f}')",
 "# prefix-composition curve: adapt slots 3..i (rank RK, independent fit), own weights elsewhere",
 "print('prefix-composition KL (adapt interior up to slot i):')",
 "for i in INTERIOR:",
 "    sel = {j: adapters[j][RK] for j in INTERIOR if j <= i}",
 "    sf = lambda l, x, pos: sel[l].apply(x, pos) if l in sel else m.block(x, l, pos)",
-"    with torch.no_grad(): loi = m.forward(idx, slot_fn=sf)",
-"    print(f'  up to slot {i}: KL {kl(full_logits, loi):.3f}')",
+"    with torch.no_grad(): loi = m.forward(EVAL, slot_fn=sf)",
+"    print(f'  up to slot {i}: KL {kl(full_eval, loi):.3f}')",
 ))
 
 cells.append(md(
