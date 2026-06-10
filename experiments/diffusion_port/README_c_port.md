@@ -148,3 +148,34 @@ PMI-debiased ranking (`conf = log p(tok) − β·log prior(tok)`, prior = corpus
 reveals favor tokens confident *relative to their base rate*; temperature floor 0.3 until the
 last 10% of steps (no premature argmax collapse); banned special ids in generation; prompts
 selected by coherence (lowest per-seq donor AR CE). No change to C or training.
+
+## Run 5 — WARM measured; generation trap persists in a new form
+
+**WARM (the phases-3–8 metric, brought to the port):** fine-tune B by the diffusion loss
+from two starts:
+
+| N steps | from B\*=C(supra) | from floor |
+|---|---|---|
+| 0 | **3.61** | 6.91 |
+| 100 | 3.14 | 3.31 |
+| 200 | 3.09 | 3.03 |
+| 800 | 2.75 | 2.56 |
+
+**Translation value: C's emission ≈ a 100-step head start of full fine-tuning** (the floor
+needs N=100 to match B\*'s zero-shot). The advantage is *transient* — curves converge by
+N≈200 (and the floor ends slightly lower at N=800) — i.e. C provides initialization value,
+not a better training trajectory; consistent with warm-start's role in the toy phases.
+
+**Generation:** the trap moved but persisted: [B] produced "the the the…" — PMI debias only
+reordered *reveals* while the *predictions* themselves were frequency-dominated; and the
+prompt picker chose junk again (lowest AR CE = the most predictable = degenerate filler
+rows — exactly backwards). Underlying profile: B\* is strong at dense-anchor infill
+(CE 3.16 @ t=0.3) and weak sparse (4.82 @ t=0.9), so from-scratch parallel text is its
+hardest regime.
+
+## Run 6 (queued) — debias the prediction, not just the reveal order
+Sampler: subtract `samp_beta·log(prior)` from the logits BEFORE softmax (frequency-penalized
+prediction) + repetition penalty `rep_gamma·log1p(count)`; semi-AR blocks shrunk to 16
+(denser anchors); prompts picked by max unique tokens (content-rich), not min CE. Plus the
+practical-recipe demo: generation from the **B\*+100-steps** warm point — the model the warm
+curve says matches the translation-value point — both prompted and unconditional.
