@@ -474,7 +474,50 @@ cells.append(code(
 "      f'(vs B*; equal ⇒ C ignores signatures)')",
 ))
 
-# ---- cell 10: save ----
+# ---- cell 10: WARM-START arm (the practical recipe; clearly separate from the contract) ----
+cells.append(code(
+"# The historical 'warm' metric (phases 3-8: translate-then-finetune always won) brought to",
+"# the final port: how much continued-training does C's translation REPLACE? Fine-tune B by",
+"# the diffusion loss for N steps starting from (a) B* = C(supra) vs (b) the floor (raw",
+"# supra). This arm DOES train B -- it is the practical recipe, reported alongside (not",
+"# inside) the strict B-never-trained contract above.",
+"WARM_STEPS, WARM_EVERY, WARM_BS = 800, 100, 16",
+"",
+"def finetune_diffusion(w_init, mask_init, steps=WARM_STEPS, every=WARM_EVERY):",
+"    w = {k: v.detach().clone().requires_grad_(True) for k, v in w_init.items()}",
+"    mr = mask_init.detach().clone().requires_grad_(True)",
+"    opt = torch.optim.AdamW(list(w.values()) + [mr], lr=1e-4)",
+"    curve = {}",
+"    for s in range(steps + 1):",
+"        if s % every == 0:",
+"            fn = lambda i: llama_forward({k: v.detach() for k, v in w.items()}, i, L_SUPRA,",
+"                                         causal=False, mask_row=mr.detach())",
+"            curve[s] = masked_ce_at(fn, held_ids, 0.5)",
+"        if s == steps: break",
+"        x0 = train_ids[torch.randint(0, train_ids.shape[0], (WARM_BS,), device=DEV)]",
+"        t = sample_mask_rate(WARM_BS); x_t, m = forward_mask(x0, t)",
+"        loss = diffusion_loss(llama_forward(w, x_t, L_SUPRA, causal=False, mask_row=mr), x0, m, t)",
+"        opt.zero_grad(); loss.backward()",
+"        torch.nn.utils.clip_grad_norm_(list(w.values()) + [mr], 1.0)",
+"        opt.step()",
+"    return curve",
+"",
+"t0 = time.time()",
+"curve_B = finetune_diffusion(wB, mrow)                      # warm from the translation",
+"curve_F = finetune_diffusion(supra, mean_row)               # warm from the raw floor",
+"print('WARM curves -- held masked-CE@0.5 after N fine-tune steps:')",
+"print(f\"{'N':>6} | {'from B*=C(supra)':>17} | {'from floor':>11}\")",
+"for s in sorted(curve_B):",
+"    print(f'{s:>6} | {curve_B[s]:>17.2f} | {curve_F[s]:>11.2f}')",
+"# how many steps does the floor need to match B*'s step-0 quality?",
+"b0 = curve_B[0]",
+"match = next((s for s in sorted(curve_F) if curve_F[s] <= b0), None)",
+"print(f'\\ntranslation value: B* starts at {b0:.2f}; the floor reaches that after '",
+"      f'{match if match is not None else f\">{WARM_STEPS}\"} fine-tune steps.')",
+"print(f'({time.time()-t0:.0f}s)')",
+))
+
+# ---- cell 11: save ----
 cells.append(code(
 "out_sd = {k: v.detach().cpu().contiguous() for k, v in wB.items()}",
 "out_sd['mercury.mask_embedding'] = mrow.detach().cpu().contiguous()",
@@ -496,7 +539,12 @@ cells.append(md(
 "- **Probe 0..10-only vs all-12**: run-3 had 4.34 vs 4.97 (unseen blocks 10-11 hurt). With",
 "  L=11 in the zoo, the gap should close; block 11 + full-depth composition remain held out.",
 "- **Shuffled-signature control** must stay separated (run-3: 8.44 vs 4.97) — the proof that",
-"  C reads per-block weights. B is never trained anywhere in this notebook.",
+"  C reads per-block weights. B is never trained in the contract arm (cells up to the save).",
+"- **WARM arm** (the phases-3–8 practical metric, returns here): held masked-CE@0.5 vs",
+"  fine-tune steps from B\\* vs from the floor. The 'translation value' line states how many",
+"  continued-training steps C's emission replaces. This arm trains B and is reported",
+"  *alongside* the strict contract result, exactly as warm@15 sat alongside zero-shot in the",
+"  toy phases.",
 ))
 
 nb = {"cells": cells,

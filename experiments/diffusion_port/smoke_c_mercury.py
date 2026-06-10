@@ -35,6 +35,7 @@ repl = {
     r"reduction='none'\).view\(32, -1\).mean\(1\)": "reduction='none').view(2, -1).mean(1)",
     r"g4 = semi_ar_generate\(fnB, prompt, 32 \+ 96, block=32, steps_per_block=32, \*\*kw\)": "g4 = semi_ar_generate(fnB, prompt, 24 + 8, block=4, steps_per_block=3, **kw)",
     r"print\(f'semi-AR cont:', repr\(decode\(g4\[b, 32:\]\)\)\)": "print(f'semi-AR cont:', repr(decode(g4[b, 24:])))",
+    r"WARM_STEPS, WARM_EVERY, WARM_BS = 800, 100, 16": "WARM_STEPS, WARM_EVERY, WARM_BS = 2, 1, 2",
 }
 for k, v in repl.items():
     src, n = re.subn(k, v, src)
