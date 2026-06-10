@@ -30,9 +30,11 @@ repl = {
     r"g1 = denoise\(fnB, ids.clone\(\), fr, steps=64": "g1 = denoise(fnB, ids.clone(), fr, steps=4",
     r"g2 = denoise_v2\(fnB, ids.clone\(\), fr, steps=128": "g2 = denoise_v2(fnB, ids.clone(), fr, steps=4",
     r"g3 = semi_ar_generate\(fnB, bos, 129, block=32, steps_per_block=32": "g3 = semi_ar_generate(fnB, bos, 9, block=4, steps_per_block=3",
-    r"prompt = held_ids\[1, :24\]\[None\].repeat\(2, 1\)": "prompt = held_ids[1, :8][None].repeat(2, 1)",
-    r"g4 = semi_ar_generate\(fnB, prompt, 24 \+ 96, block=32, steps_per_block=32": "g4 = semi_ar_generate(fnB, prompt, 8 + 8, block=4, steps_per_block=3",
-    r"print\('semi-AR continuation:', repr\(decode\(g4\[0, 24:\]\)\)\)": "print('semi-AR continuation:', repr(decode(g4[0, 8:])))",
+    r"lo = llama_forward\(supra, held_ids\[:32, :-1\], L_SUPRA\)": "lo = llama_forward(supra, held_ids[:2, :-1], L_SUPRA)",
+    r"ce_seq = F.cross_entropy\(lo.reshape\(-1, V\), held_ids\[:32, 1:\].reshape\(-1\),": "ce_seq = F.cross_entropy(lo.reshape(-1, V), held_ids[:2, 1:].reshape(-1),",
+    r"reduction='none'\).view\(32, -1\).mean\(1\)": "reduction='none').view(2, -1).mean(1)",
+    r"g4 = semi_ar_generate\(fnB, prompt, 32 \+ 96, block=32, steps_per_block=32, \*\*kw\)": "g4 = semi_ar_generate(fnB, prompt, 24 + 8, block=4, steps_per_block=3, **kw)",
+    r"print\(f'semi-AR cont:', repr\(decode\(g4\[b, 32:\]\)\)\)": "print(f'semi-AR cont:', repr(decode(g4[b, 24:])))",
 }
 for k, v in repl.items():
     src, n = re.subn(k, v, src)

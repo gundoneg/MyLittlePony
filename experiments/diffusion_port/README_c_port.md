@@ -119,3 +119,32 @@ denoiser, masked-CE ~5.1 ≫ donor AR 1.5; parallel generation not yet fluent) a
 self-zoo sharing weights with the target. The mechanism is proven; closing the
 quality gap is the scale/budget axis (more truncation depths incl. 11–12, larger rank,
 bigger corpus), or the BASELINE continued-training ceiling for comparison.
+
+## Run 4 — the five decision-graph paths — quality jump, generation trap diagnosed
+
+Corpus v2 (unigram-prompted) + L=11 truncation + 64×64 subspace + KD soft targets + 6000 steps:
+
+| held masked-CE (donor AR = 1.60) | t=0.3 | t=0.5 | t=0.7 | t=0.9 |
+|---|---|---|---|---|
+| floor (raw bidir) | 6.01 | 6.84 | 7.62 | 9.30 |
+| B\* run-3 (for reference) | ~5.1 flat | | | |
+| **B\* run-4** | **3.16** | **3.66** | **4.09** | **4.82** |
+
+- **Reconstruction 34.5% vs floor 14.9%** (run-3: 25.6 vs 24.4 — barely separated), and the
+  recovered text is *readable* (near-semantic recovery of a weather-advice paragraph).
+- **Probe closed:** deltas on 0..10 = 3.59 vs all-12 = 3.58 (run-3: 4.34 vs 4.97) — the L=11
+  truncation fixed the unseen-blocks weakness exactly as the graph predicted.
+- Control still cleanly separated: shuffled signatures 8.53 vs 3.58.
+
+**Remaining failure — from-scratch generation collapses into the *filler-confidence trap*:**
+in a sea of masks the model's most-confident tokens are whitespace/newline/`</s>`; raw
+confidence ranking reveals them first, they become the anchors, and the cascade fills the
+sequence with fillers ([B] = all newlines, [C] = all spaces; [A], the only sampler with
+non-zero constant temperature, produced fragments of content). Reconstruction works because
+real-text anchors exist. The run-4 prompted test also accidentally used a junk prompt row.
+
+## Run 5 (queued) — sampler-only fixes for the filler trap
+PMI-debiased ranking (`conf = log p(tok) − β·log prior(tok)`, prior = corpus unigram) so
+reveals favor tokens confident *relative to their base rate*; temperature floor 0.3 until the
+last 10% of steps (no premature argmax collapse); banned special ids in generation; prompts
+selected by coherence (lowest per-seq donor AR CE). No change to C or training.
