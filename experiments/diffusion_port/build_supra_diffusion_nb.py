@@ -23,7 +23,13 @@ def _src(lines):
 cells = []
 
 cells.append(md(
-"# supra50m → Mercury-2-style diffusion LM (the project's final port)",
+"# [BASELINE] supra50m → Mercury-2-style diffusion LM (original-paper recipe)",
+"",
+"> **Note.** This notebook implements the *original Mercury/DiffuLLaMA path* — **gradual",
+"> adaptation (continued training) of the transformer itself**. That is NOT the project's",
+"> method: it serves as the **reference ceiling**. The project-method port — where model B",
+"> is produced *exclusively by the weight-translator C* with zero training of B — is",
+"> `c_mercury_port.ipynb` in this folder.",
 "",
 "**Goal.** Translate the knowledge of `SupraLabs/Supra-50M-Instruct` (an autoregressive",
 "12-layer Llama) into a **Mercury-like discrete-diffusion LM**: the same backbone acting as",
