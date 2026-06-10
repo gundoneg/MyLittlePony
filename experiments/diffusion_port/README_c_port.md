@@ -78,17 +78,44 @@ spectra) is statistically nothing like a well-trained 12-layer model: supra's bl
 signatures are OOD for C's encoder, and the corrections C learned for weak matrices are the
 wrong ones for trained matrices. The frame fix (run 2) was necessary but not sufficient.
 
-## Run 3 (queued) — self-zoo: the zoo IS supra's own sub-stacks
+## Run 3 — self-zoo: the zoo IS supra's own sub-stacks — **POSITIVE**
 
 "Align the zoo and supra into one frame" taken to its logical end: build the zoo from
 **depth-truncated sub-stacks of supra itself** (layers 0..L−1 + final norm + tied head,
-L ∈ {2,4,6,8,10} — valid AR models). Zoo frames and weight statistics are then *exactly* the
-target's; C learns the AR→denoiser per-block rule on real supra blocks in shallow contexts
-and extrapolates to the full L=12 stack (phase-10 E0/E3 territory). Honest disclosure: the
-zoo now shares weights with the target — held-out is the full-depth composition and blocks
-10–11 (never seen in training). B is still never trained. Bonus: zoo pretraining disappears
-entirely (truncations are free) — the session drops to ~15–20 min.
+L ∈ {2,4,6,8,10} — valid AR models, AR CE 8.75/7.75/7.87/5.70/2.79). Zoo frames and weight
+statistics are then *exactly* the target's; C learns the AR→denoiser per-block rule on real
+supra blocks in shallow contexts and extrapolates to the full L=12 stack. Honest disclosure:
+the zoo shares weights with the target — held-out is the full-depth composition and blocks
+10–11 (never seen as interior). B is still never trained. Zoo pretraining disappears
+(truncations are free) — the session is ~10 min.
 
-If run 3 still fails, the clean conclusion is: AR→diffusion conversion is not reachable by
-tiny structured weight edits emitted from weight signatures — it genuinely requires the
-continued-training path (the BASELINE) — itself a decisive answer to the project question.
+### Result — B* = C(supra) beats the floor at every noise level, and the control proves C reads the weights
+
+| held masked-CE (uniform=10.37, donor AR=1.51) | t=0.3 | t=0.5 | t=0.7 | t=0.9 |
+|---|---|---|---|---|
+| floor (raw supra, bidirectional) | 5.49 | 5.94 | 6.99 | 9.54 |
+| **B\* = C(supra)** | **5.10** | **5.11** | **5.14** | **5.18** |
+
+- B\* is **flat ~5.1 across all mask rates** — genuine denoiser behaviour — while the floor
+  degrades with noise; decisive at t=0.9 (5.18 vs 9.54). **B was never trained**; this is
+  entirely C's emitted per-block deltas + [MASK] embedding.
+- **Signature control (decisive):** shuffling the block signatures fed to C gives masked-CE
+  **8.44** vs B\* **4.97** — a huge gap (in runs 1–2 this control *matched* B\*). So **C
+  genuinely reads each block's spectrum**; the per-block weight-translation mechanism is real,
+  not a global smoothing trick.
+- **Extrapolation probe:** applying C's deltas to blocks 0..9 only (seen in truncation
+  contexts) and leaving 10–11 raw scores **4.34** — better than deltas on all 12 (4.97). The
+  seen-context blocks transfer cleanly; the last two (never an interior at trunc≤10) are the
+  weak point (fixable: include L=11/12 truncations or a separate last-block treatment).
+- Reconstruction (25% mask): floor 24.4% vs B\* 25.6% (low-noise, both ok). From-scratch
+  parallel generation is still degenerate — the hardest mode at this tiny budget.
+
+### Verdict
+The project's thesis is demonstrated on a real model: **knowledge moved across an
+architectural change (AR → discrete diffusion) purely by the weight-translator C, with zero
+training of model B**, using only data sampled from the donor — and a control confirms C
+operates per-block on the actual weights. Limitations are quality/scale (B\* is a weak
+denoiser, masked-CE ~5.1 ≫ donor AR 1.5; parallel generation not yet fluent) and the
+self-zoo sharing weights with the target. The mechanism is proven; closing the
+quality gap is the scale/budget axis (more truncation depths incl. 11–12, larger rank,
+bigger corpus), or the BASELINE continued-training ceiling for comparison.
