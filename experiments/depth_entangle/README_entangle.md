@@ -1,5 +1,9 @@
 # Phase 9 — are real LLM layers depth-entangled (worst case) or redundant (tied-like)?
 
+> **Phase-10 update (see end): the "incompressible" verdict below is OVERTURNED.** A
+> teacher-forced + cascade rank-16 adapter on one exemplar reproduces the whole interior to
+> end-to-end KL 0.55 (from verbatim 7.27). The original negative was a training artifact.
+
 ## Why
 Phase 8 found that the per-block weight-translator `C` cannot extrapolate in depth on our
 toy: donors **co-adapt their layers to the total depth**, so a shallow zoo's per-block
@@ -157,3 +161,39 @@ single perturbations, yet high-rank and therefore incompressible in depth.
 - "Interchangeable interior" supports depth-extrapolation of `C`, but the *early* unique
   layers still must be covered explicitly — depth-matching is replaced by *type*-matching,
   not eliminated.
+
+---
+
+# Phase 10 / E1 — re-test: the deep interior IS largely compressible (teacher-forced + cascade)
+
+The phase-9 "finale+/adapter" above concluded the interior is *incompressible* (verbatim
+tile KL ~6.5; a light adapter trained end-to-end by logit-KL plateaued at held-out ~3.5).
+That test was **data-starved** (307K params vs ~3K tokens) and trained all slots **end-to-end
+through compounded corruption**. `e1_kaggle.ipynb` re-tests on the same model
+(`SupraLabs/Supra-50M-Instruct`, Kaggle GPU) with **teacher forcing** (fit each slot's
+exemplar+LoRA to map the model's TRUE `h_i -> h_{i+1}`) and **cascade composition**.
+
+Results (exemplar L6 -> interior slots 3..10):
+- Teacher-forced per-slot **relative update error**: r=0 ~1.0 -> r=64 ~0.5 (saturates; one
+  exemplar+LoRA cannot perfectly match a slot *locally* -- consistent with the layers being
+  distinct).
+- **End-to-end composed KL** (the real test): verbatim tile **7.27** -> independent rank-16
+  LoRA **1.15** -> rank-64 1.08.
+- **Cascade-fit rank-16: 0.55** -- fitting each slot on inputs propagated through the
+  already-adapted earlier slots halves the independent-composition error and closes ~92% of
+  the verbatim->exact KL gap.
+- **Prefix curve**: per-slot KL increment ~0.12, compounding across the 8 slots (slot 3 alone
+  0.125 -> all eight 1.148). The obstacle is **composition covariate shift, not local rank**;
+  cascade corrects it.
+
+**Verdict: phase-9's "incompressible" is overturned.** A single shared exemplar + rank-16
+per-slot LoRA, fit teacher-forced with cascade, reproduces the whole 8-layer interior to
+end-to-end KL **0.55** (from garbage 7.27). The earlier negative was the data-starved /
+end-to-end / no-cascade training (flaw F1), not a fundamental high-rank requirement (flaw F2
+refuted: rank 16 suffices despite local rel-err ~0.5, because cascade undoes the compounding).
+Residual KL 0.55 != 0 means the interior is **mostly, not perfectly, one-type-compressible**.
+
+Caveats: the `full`-refit control column is unreliable (full-matrix refit diverged at lr
+3e-3 -- an optimization artifact; the notebook now uses a lower LR for it); KL 0.55 is still
+nonzero (higher rank / more cascade passes / a second exemplar would likely lower it);
+self-generated probe.

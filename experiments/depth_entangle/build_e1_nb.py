@@ -210,7 +210,7 @@ cells.append(code(
 "    X = src.reshape(-1, m.d); Y = tgt.reshape(-1, m.d)",
 "    true_upd = (Y - X)",
 "    ad = SlotAdapter(EXEMPLAR, rank, full).to(DEV)",
-"    opt = torch.optim.Adam(ad.parameters(), lr=3e-3)",
+"    opt = torch.optim.Adam(ad.parameters(), lr=(5e-4 if full else 3e-3))  # full refit needs a gentler LR",
 "    Bsz, T = src.shape[0], src.shape[1]",
 "    for s in range(steps):",
 "        bi = torch.randint(0, Bsz, (max(1, bs // T),), device=DEV)",
