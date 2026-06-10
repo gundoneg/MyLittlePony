@@ -56,6 +56,39 @@ greedy, exact, on real supra) cuts corpus generation ~10×; SVD cached once; don
 repetitive (a 50M donor talking to itself) — that is the honest data budget; masked-CE is
 measured against exactly that distribution.
 
-Notebook: `c_mercury_port.ipynb` (regenerate with `build_c_mercury_nb.py`). Pending: the
-Kaggle GPU run — does B*=C(supra) now beat the floor, and does the shuffled-signature control
-finally separate (proving C reads each block)?
+Notebook: `c_mercury_port.ipynb` (regenerate with `build_c_mercury_nb.py`).
+
+### Run-2 result — NEGATIVE again, sharper diagnosis
+
+KV-cached generation worked (corpus 1339s → 86s, ×15). C improved zoo donors
+(masked-CE@0.5 7.09 → 4.91), but zero-shot on supra:
+
+| held masked-CE | t=0.3 | t=0.5 | t=0.7 | t=0.9 |
+|---|---|---|---|---|
+| floor (raw bidir) | 5.44 | 6.04 | 7.05 | 9.39 |
+| B* = C(supra) | 8.34 | 8.34 | 8.67 | **8.71** |
+
+B* beats the floor **only at t=0.9** and is flat ~8.3–8.7 across t; reconstruction 11.6% vs
+floor 22.9%; shuffled-signature control still matches (8.18 vs 8.34). Reading: C learned a
+roughly global "smooth the predictions" delta — useful for weak zoo donors in the high-noise
+regime, destructive for a sharp trained model at low noise.
+
+**Diagnosis — donor-distribution gap.** The zoo (shallow, barely-trained, random-init
+spectra) is statistically nothing like a well-trained 12-layer model: supra's block
+signatures are OOD for C's encoder, and the corrections C learned for weak matrices are the
+wrong ones for trained matrices. The frame fix (run 2) was necessary but not sufficient.
+
+## Run 3 (queued) — self-zoo: the zoo IS supra's own sub-stacks
+
+"Align the zoo and supra into one frame" taken to its logical end: build the zoo from
+**depth-truncated sub-stacks of supra itself** (layers 0..L−1 + final norm + tied head,
+L ∈ {2,4,6,8,10} — valid AR models). Zoo frames and weight statistics are then *exactly* the
+target's; C learns the AR→denoiser per-block rule on real supra blocks in shallow contexts
+and extrapolates to the full L=12 stack (phase-10 E0/E3 territory). Honest disclosure: the
+zoo now shares weights with the target — held-out is the full-depth composition and blocks
+10–11 (never seen in training). B is still never trained. Bonus: zoo pretraining disappears
+entirely (truncations are free) — the session drops to ~15–20 min.
+
+If run 3 still fails, the clean conclusion is: AR→diffusion conversion is not reachable by
+tiny structured weight edits emitted from weight signatures — it genuinely requires the
+continued-training path (the BASELINE) — itself a decisive answer to the project question.
