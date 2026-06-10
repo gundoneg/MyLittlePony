@@ -62,6 +62,41 @@ user's "cover the layer-type repertoire" lens for the non-recursive regime — w
 is where real LLM deep layers largely sit (small near-orthogonal *refinements*, not strong
 recursion), so real-model depth transfer should sit toward the favorable end.
 
+## E3 — the alpha=1 gap is few-shot-closeable and localized to `M_block` (`run_fewshot.py`)
+E0 left a real gap at alpha=1 (genuinely recursive depth). E3 asks how cheaply fine-tuning
+`C` closes it, and where the depth knowledge lives. Setup: train `C` on a shallow L2 zoo
+(E0-fixed common frame + scale_free), fine-tune a copy on *n* deep donors (diverse maxjump,
+disjoint held), zero-shot on held deep donors. **Native ceiling = 100%** here (the bridged
+frame + diverse deep donors give a strong frame — retroactively confirming E0's low natives
+were frame-quality, not depth).
+
+**Donors-needed curve (L2→L3, alpha=1, fine-tune all params, 150 steps):**
+
+| n deep donors | 0 (E0 baseline) | 1 | 2 | 4 |
+|---|---|---|---|---|
+| held zero-shot | 17.2% | 33.4% | 45.2% | **52.8%** |
+
+A handful of deep donors **monotonically closes the gap** (17→53% toward native 100%) — the
+practical recipe is "shallow zoo + a few deep donors", not a full deep zoo.
+
+**Parameter-group ablation (n=2, where the gap lives):**
+
+| fine-tune | vocab (σ path) | encoder | **M_block** | all |
+|---|---|---|---|---|
+| held zero-shot | 31.1% | 12.5% | **65.9%** | 45.2% |
+
+The depth gap is **localized to `M_block`** — the shared per-block interior generator.
+Fine-tuning only that one matrix gives 65.9%, *beating* fine-tuning everything (45.2%, which
+overfits the well-trained vocab/encoder on 2 donors) and far above the σ-path. So depth
+adaptation is a **tiny, targeted update of a single shared parameter**, not a re-learn.
+
+**Net (E0+E3).** The per-block translator's depth limitation is neither fundamental nor a
+blanket failure: transfer already works where the deep computation is non-recursive (E0,
+alpha=0), and the residual recursive-depth gap is closed by fine-tuning one shared parameter
+(`M_block`) on a few deep donors (E3). This substantially rehabilitates "train shallow → port
+deep": cover the repertoire with small models, then spend a few deep donors on a targeted
+`M_block` update.
+
 ## Honest caveats
 - Toy scale (V=16, d=64, n=8 donors): absolute numbers are noisy (native ceiling 58–85% across
   seeds); the **alpha contrast and the OLD-vs-FIXED gap** are the portable signal, not the
@@ -73,3 +108,8 @@ recursion), so real-model depth transfer should sit toward the favorable end.
 - Tied regime confirmed the alpha-contrast in *ratio* but with near-chance native ceilings (tied
   zero-shot is inherently low/noisy at toy scale; the data-align realistic pipeline is what
   produces high zero-shot, as in phase 5).
+- E3: held deep donors share the bridged frame with the fine-tune donors (a favorable gauge
+  leak absent in real deployment) — report it. `M_block`-only beating `all` is partly that
+  fine-tuning all params on just 2 donors overfits the rest; with more donors/steps `all` may
+  catch up. The localization (depth lives in `M_block`) and the monotone few-shot curve are the
+  portable signals.
