@@ -37,3 +37,25 @@ probe — the allowed budget) is added. Then the signature can carry, and the de
 
 Practical note: AR self-generation of the corpus took ~22 min (no KV cache) — add caching or
 shrink the corpus next iteration.
+
+## Run 2 (SVD-frame deltas + speedups) — to run on Kaggle
+
+**Fix for the frame mismatch.** Instead of explicitly rotating the zoo into supra's frame
+(which would break RMSNorm — the wrong symmetry group, phase 3c — and contaminate C with
+rotation-correction behavior absent in supra), C now emits each block's correction **in that
+matrix's own SVD frame**: `ΔW = Uᵣ · A(z) · Vᵣᵀ`, where `Uᵣ,Vᵣ` are the donor matrix's
+intrinsic singular vectors (cached once) and `A(z)` is a small r×r correction C predicts from
+the gauge-invariant signature. C's input is gauge-invariant and its **output is gauge-
+covariant**, so the delta always lands in the model's current frame *by construction* — the
+correct "one frame" for zoo and supra, with no model rotated. Norm corrections are per-layer
+scalars (frame-free); the [MASK] embedding is a softmax combo of the donor's own rows.
+
+**Speedups (no quality loss).** KV-cached self-generation (validated: cached == uncached
+greedy, exact, on real supra) cuts corpus generation ~10×; SVD cached once; donor steps
+1200→800 (donors overfit the tiny corpus regardless). The bare-BOS self-generated text is
+repetitive (a 50M donor talking to itself) — that is the honest data budget; masked-CE is
+measured against exactly that distribution.
+
+Notebook: `c_mercury_port.ipynb` (regenerate with `build_c_mercury_nb.py`). Pending: the
+Kaggle GPU run — does B*=C(supra) now beat the floor, and does the shuffled-signature control
+finally separate (proving C reads each block)?
