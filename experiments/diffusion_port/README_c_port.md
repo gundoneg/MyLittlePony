@@ -179,3 +179,32 @@ prediction) + repetition penalty `rep_gamma·log1p(count)`; semi-AR blocks shrun
 (denser anchors); prompts picked by max unique tokens (content-rich), not min CE. Plus the
 practical-recipe demo: generation from the **B\*+100-steps** warm point — the model the warm
 curve says matches the translation-value point — both prompted and unconditional.
+
+## Run 6 (dual-T4) — thesis fully demonstrated; generation = real on-topic words, looping
+
+2×T4 parallelism: KD teacher on cuda:1 (overlapped), warm arms concurrent, corpus split (~32
+min vs ~45). Numbers (donor AR=1.67):
+
+| held masked-CE | t=0.3 | t=0.5 | t=0.7 | t=0.9 |
+|---|---|---|---|---|
+| floor | 6.50 | 6.91 | 8.36 | 10.05 |
+| **B\*=C(supra)** | **3.61** | **4.01** | **4.46** | **5.20** |
+
+- **Reconstruction: B\* 23.5% vs floor 1.5%**, recovered text coherent ("...with your grade I
+  would prefer it to my next exam... please let me know the answer and provide more context of
+  the article... The answer is...").
+- **Control: shuffled signatures 10.68 vs B\* 3.99** — mechanism rock-solid.
+- **WARM: translation = ~100-step head start** (B\* 3.96; floor reaches it at N=100), transient.
+- **Generation: run-6 sampler fixes WORKED** — the filler trap is gone, replaced by REAL
+  on-topic content with *repetition loops*: prompt-about-stress → "It Stress Stress...
+  stressful stress can"; prompt-about-the-world → "global globally... Africa Tanzania Kenya...
+  East African... South Coast". B\*+100: "stress when depression... anxiety and depression".
+
+This is the classic diffusion-LM repetition loop (a late, well-understood failure), on top of
+a model that now predicts the right topic and real words.
+
+## Run 7 (queued) — no-repeat-n-gram + temperature, to break the loops
+Sampler-only (no retraining): a no-repeat-3-gram **hard logit ban** (forbid completing any
+n-gram already in the sequence given the revealed left context) and the temperature floor
+raised 0.3→0.7 — run-6's near-argmax floor was what locked the loops. This is exactly how AR
+LMs avoid the same loops; expected to yield readable, non-repeating, on-topic text.
