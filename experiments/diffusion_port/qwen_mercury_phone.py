@@ -45,8 +45,19 @@ def parse_args():
     ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--threads", type=int, default=0, help="0 = all cores")
     return ap.parse_args()
+
+
+NROLE, R_EMB = 40, 8
+KNOWN_ROLES = ['out_proj', 'in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'gate_proj',
+               'up_proj', 'down_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate']
+
+
+def role_id(leaf):
+    return KNOWN_ROLES.index(leaf) if leaf in KNOWN_ROLES else \
+        len(KNOWN_ROLES) + (sum(map(ord, leaf)) % (NROLE - len(KNOWN_ROLES)))
 
 
 ARGS = parse_args()
@@ -279,30 +290,37 @@ def semi_ar_generate(fn, prompt, total_len, block=16, steps_per_block=16, **kw):
 
 
 # ---------------- architecture-agnostic translator C (hooks) ----------------
+LTYPE = getattr(model.config, "layer_types", None)
+def is_linear(l):
+    return bool(LTYPE) and LTYPE[l] == "linear_attention"
+
 t0 = time.time()
 LINS = []
 with torch.no_grad():
     for l in range(L_FULL):
-        cand = [mm for _, mm in layers[l].named_modules()
+        cand = [(n, mm) for n, mm in layers[l].named_modules()
                 if isinstance(mm, nn.Linear) and mm.weight.ndim == 2
                 and min(mm.weight.shape) >= 16]
-        cand.sort(key=lambda mm: -mm.weight.numel())
-        for mm in cand[:ARGS.max_per_layer]:
+        cand.sort(key=lambda nm: -nm[1].weight.numel())
+        for name, mm in cand[:ARGS.max_per_layer]:
             W = mm.weight
             U, S, Vv = torch.svd_lowrank(W, q=min(ARGS.sub + 8, min(W.shape) - 1), niter=4)
             r = min(ARGS.sub, U.shape[1])
             mm._Ud = U[:, :r].contiguous()
             mm._Vd = Vv[:, :r].contiguous()
-            mm._r = r; mm._A = None; mm._on = False
+            mm._r = r; mm._A = None; mm._on = False; mm._layer = l
+            mm._role = role_id(name.split(".")[-1])
             spec = torch.zeros(ARGS.sig_k)
             s = (S / (S.norm() + 1e-9))[:ARGS.sig_k]
             spec[:s.numel()] = s
             mm._sig = torch.cat([spec, torch.tensor(
                 [math.log(W.norm().item() + 1e-9) / 10, math.log(W.shape[0]) / 12,
-                 math.log(W.shape[1]) / 12, l / (L_FULL - 1)])])
+                 math.log(W.shape[1]) / 12, l / (L_FULL - 1),
+                 1.0 if is_linear(l) else 0.0])])
             LINS.append(mm)
-SIG_DIM = ARGS.sig_k + 4
-print(f"{len(LINS)} Linear matrices translated ({time.time()-t0:.0f}s)")
+SIG_DIM = ARGS.sig_k + 5
+print(f"{len(LINS)} Linear matrices translated ({time.time()-t0:.0f}s); "
+      f"distinct roles {len({mm._role for mm in LINS})}")
 
 
 def _delta_hook(mod, inp, out):
@@ -316,10 +334,11 @@ for mm in LINS:
 
 
 class TranslatorC(nn.Module):
-    def __init__(self, d_z=ARGS.d_z, sub=ARGS.sub, h=128):
+    def __init__(self, d_z=ARGS.d_z, sub=ARGS.sub, h=160):
         super().__init__()
         self.sub = sub
-        self.enc = nn.Sequential(nn.Linear(SIG_DIM, h), nn.SiLU(),
+        self.role_emb = nn.Embedding(NROLE, R_EMB)
+        self.enc = nn.Sequential(nn.Linear(SIG_DIM + R_EMB, h), nn.SiLU(),
                                  nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
         self.M = nn.Parameter(torch.zeros(sub * sub, d_z))
         self.mask_logits = nn.Parameter(torch.zeros(V))
@@ -327,12 +346,15 @@ class TranslatorC(nn.Module):
     def mask_row(self):
         return self.mask_logits.softmax(0) @ E_W
 
+    def _z(self, mm):
+        return self.enc(torch.cat([mm._sig, self.role_emb(torch.tensor(mm._role))]))
+
     def install(self, Lt):
         for mm in LINS:
-            if mm._sig[-1].item() * (L_FULL - 1) >= Lt:
+            if mm._layer >= Lt:
                 mm._on = False
                 continue
-            A = (self.M @ self.enc(mm._sig)).view(self.sub, self.sub)
+            A = (self.M @ self._z(mm)).view(self.sub, self.sub)
             mm._A = A[:mm._r, :mm._r]
             mm._on = True
 
@@ -342,7 +364,7 @@ class TranslatorC(nn.Module):
 
 
 C = TranslatorC()
-opt = torch.optim.AdamW(C.parameters(), lr=3e-4)
+opt = torch.optim.AdamW(C.parameters(), lr=ARGS.lr)
 start_step = 1
 if ARGS.resume and os.path.exists(CKPT):
     st = torch.load(CKPT)
@@ -435,23 +457,23 @@ C.uninstall()
 print("\nprompt      :", repr(tok.decode(prompt[0])))
 print("semi-AR cont:", repr(tok.decode(g4[0, 24:].clamp_max(V - 1))))
 
-orig = [mm._sig for mm in LINS]
+o_sig = [mm._sig for mm in LINS]; o_role = [mm._role for mm in LINS]
 perm = torch.randperm(len(LINS)).tolist()
 for i, mm in enumerate(LINS):
-    mm._sig = orig[perm[i]]
+    mm._sig, mm._role = o_sig[perm[i]], o_role[perm[i]]
 C.install(L_FULL); mm_ce = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
 for i, mm in enumerate(LINS):
-    mm._sig = orig[i]
+    mm._sig, mm._role = o_sig[i], o_role[i]
 C.install(L_FULL); bb = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
-print(f"\ncontrol — shuffled-signature masked-CE@0.5: {mm_ce:.2f} "
-      f"(vs B* {bb:.2f}; equal => C ignores signatures)")
+print(f"\ncontrol — shuffled-identity masked-CE@0.5: {mm_ce:.2f} "
+      f"(vs B* {bb:.2f}; equal => C ignores it)")
 
 # ---------------- save translation pack ----------------
 from safetensors.torch import save_file
 pack = {"mercury.mask_embedding": mrow.detach().float()}
 with torch.no_grad():
     for i, mm in enumerate(LINS):
-        A = (C.M @ C.enc(mm._sig)).view(ARGS.sub, ARGS.sub)[:mm._r, :mm._r]
+        A = (C.M @ C._z(mm)).view(ARGS.sub, ARGS.sub)[:mm._r, :mm._r]
         pack[f"lin{i}.UA"] = (mm._Ud @ A).contiguous()
         pack[f"lin{i}.V"] = mm._Vd.contiguous()
 path = os.path.join(ARGS.workdir, "mercury_pack.safetensors")

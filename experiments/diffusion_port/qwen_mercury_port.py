@@ -1,5 +1,5 @@
 """Qwen3.5 -> Mercury-2 diffusion by translator C (architecture-agnostic). Kaggle GPU T4 x2 + Internet.
-PILOT=True first (Qwen3.5-0.8B, smoke), then PILOT=False for 9B. From qwen_mercury_port.ipynb."""
+PILOT=True first (Qwen3.5-0.8B), then PILOT=False for 9B. From qwen_mercury_port.ipynb."""
 
 
 # # Qwen3.5 → Mercury-2 diffusion LM **by the translator C** (architecture-agnostic, at scale)
@@ -35,11 +35,14 @@ MODEL_ID = 'Qwen/Qwen3.5-0.8B' if PILOT else 'Qwen/Qwen3.5-9B'
 N_GEN    = 256 if PILOT else 512
 N_HELD   = 32  if PILOT else 48
 SEQ_LEN  = 160
-C_STEPS  = 800 if PILOT else 2000
+C_STEPS  = 2000 if PILOT else 2400
 C_BS     = 4   if PILOT else 2
+LR       = 5e-4        # peak lr (warmup 100) -- higher than supra's 3e-4 to fit more in-budget
 SUB      = 48          # SVD-frame correction subspace (A is SUB x SUB)
 SIG_K    = 32          # singular values kept in a matrix's signature
 D_Z      = 16
+R_EMB    = 8           # learned per-role embedding (lets C distinguish matrix roles)
+NROLE    = 40
 MAX_PER_LAYER = 10     # cap nn.Linear per layer (largest by numel) -> bounds SVD cost on MoE
 EPS_T    = 0.05
 KD_LAMBDA, KD_TOPK = 0.3, 64
@@ -227,27 +230,37 @@ print('diffusion core + samplers ready')
 # %% ---- cell ----
 # Discover every nn.Linear in each decoder layer (DeltaNet in/out proj, full-attn q/k/v/o,
 # MoE expert/router linears, MLP) -> cap to the MAX_PER_LAYER largest by numel per layer.
-t0 = time.time(); LINS = []   # flat list of dicts: {mod, sig}
+KNOWN_ROLES = ['out_proj','in_proj_qkv','in_proj_z','in_proj_b','in_proj_a','gate_proj',
+               'up_proj','down_proj','q_proj','k_proj','v_proj','o_proj','gate']
+def role_id(leaf):
+    return KNOWN_ROLES.index(leaf) if leaf in KNOWN_ROLES else \
+           len(KNOWN_ROLES) + (sum(map(ord, leaf)) % (NROLE - len(KNOWN_ROLES)))
+LTYPE = getattr(model.config, 'layer_types', None)
+def is_linear(l): return bool(LTYPE) and LTYPE[l] == 'linear_attention'
+
+t0 = time.time(); LINS = []
 with torch.no_grad():
     for l in range(L_FULL):
-        cand = [mm for _, mm in layers[l].named_modules()
+        cand = [(n, mm) for n, mm in layers[l].named_modules()
                 if isinstance(mm, nn.Linear) and mm.weight.ndim == 2 and min(mm.weight.shape) >= 16]
-        cand.sort(key=lambda mm: -mm.weight.numel())
-        for mm in cand[:MAX_PER_LAYER]:
+        cand.sort(key=lambda nm: -nm[1].weight.numel())
+        for name, mm in cand[:MAX_PER_LAYER]:
             W = mm.weight.float()
             U, S, Vv = torch.svd_lowrank(W, q=min(SUB + 8, min(W.shape) - 1), niter=4)
             r = min(SUB, U.shape[1])
             mm._Ud = U[:, :r].to(mm.weight.dtype).contiguous()
             mm._Vd = Vv[:, :r].to(mm.weight.dtype).contiguous()
-            mm._r = r; mm._A = None; mm._on = False
+            mm._r = r; mm._A = None; mm._on = False; mm._layer = l
+            mm._role = role_id(name.split('.')[-1])
             spec = torch.zeros(SIG_K); s = (S / (S.norm() + 1e-9))[:SIG_K]; spec[:s.numel()] = s.cpu()
-            sig = torch.cat([spec, torch.tensor([math.log(W.norm().item() + 1e-9) / 10,
-                             math.log(W.shape[0]) / 12, math.log(W.shape[1]) / 12, l / (L_FULL - 1)])])
-            mm._sig = sig.to(DEV0)
+            mm._sig = torch.cat([spec, torch.tensor([math.log(W.norm().item() + 1e-9) / 10,
+                math.log(W.shape[0]) / 12, math.log(W.shape[1]) / 12, l / (L_FULL - 1),
+                1.0 if is_linear(l) else 0.0])]).to(DEV0)   # +depth +type(linear/full)
             LINS.append(mm)
-        if l % 8 == 0: torch.cuda.empty_cache()
-SIG_DIM = SIG_K + 4
-print(f'{len(LINS)} Linear matrices translated ({time.time()-t0:.0f}s); SVD-frame dim {SUB}')
+        if torch.cuda.is_available() and l % 8 == 0: torch.cuda.empty_cache()
+SIG_DIM = SIG_K + 5
+print(f'{len(LINS)} Linear matrices translated ({time.time()-t0:.0f}s); distinct roles:',
+      len({mm._role for mm in LINS}))
 
 def _delta_hook(mod, inp, out):
     if getattr(mod, '_on', False) and mod._A is not None:
@@ -256,26 +269,32 @@ def _delta_hook(mod, inp, out):
 for mm in LINS: mm.register_forward_hook(_delta_hook)
 
 class TranslatorC(nn.Module):
-    def __init__(self, d_z=D_Z, sub=SUB, h=128):
+    """Per-matrix: emit an SVD-frame correction from the matrix's signature + a learned
+    role embedding (so C distinguishes in_proj_qkv vs gate_proj vs o_proj ... rather than
+    averaging over all 186 heterogeneous matrices) + the layer type (linear/full)."""
+    def __init__(self, d_z=D_Z, sub=SUB, h=160):
         super().__init__(); self.sub = sub
-        self.enc = nn.Sequential(nn.Linear(SIG_DIM, h), nn.SiLU(), nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
+        self.role_emb = nn.Embedding(NROLE, R_EMB)
+        self.enc = nn.Sequential(nn.Linear(SIG_DIM + R_EMB, h), nn.SiLU(),
+                                 nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
         self.M = nn.Parameter(torch.zeros(sub * sub, d_z))     # zero-init => B == floor
         self.mask_logits = nn.Parameter(torch.zeros(V))
     def mask_row(self): return self.mask_logits.softmax(0).to(E_W.device, E_W.dtype) @ E_W
+    def _z(self, mm):
+        re = self.role_emb(torch.tensor(mm._role, device=mm._sig.device))
+        return self.enc(torch.cat([mm._sig, re]))
     def install(self, Lt):
-        zc = {}
         for mm in LINS:
-            if mm._sig[-1].item() * (L_FULL - 1) >= Lt: mm._on = False; continue   # layer >= Lt: off
-            A = (self.M @ self.enc(mm._sig)).view(self.sub, self.sub)
-            r = mm._r
-            mm._A = (A[:r, :r]).to(mm.weight.device, mm.weight.dtype); mm._on = True
+            if mm._layer >= Lt: mm._on = False; continue
+            A = (self.M @ self._z(mm)).view(self.sub, self.sub)
+            mm._A = A[:mm._r, :mm._r].to(mm.weight.device, mm.weight.dtype); mm._on = True
     def uninstall(self):
         for mm in LINS: mm._on = False
 C = TranslatorC().to(DEV0)
 print('C params:', sum(p.numel() for p in C.parameters()))
 
 # %% ---- cell ----
-opt = torch.optim.AdamW(C.parameters(), lr=3e-4)
+opt = torch.optim.AdamW(C.parameters(), lr=LR)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 100))
 ema, t0 = None, time.time()
 for step in range(1, C_STEPS + 1):
@@ -340,20 +359,21 @@ for b in range(2):
     print(f'\nprompt {b}   :', repr(tok.decode(prompt[b])))
     print('semi-AR cont:', repr(tok.decode(g4[b, 32:].clamp_max(V - 1))))
 
-# control: shuffle each matrix's signature -> if CE unchanged, C ignores the weights
-orig = [mm._sig for mm in LINS]; perm = torch.randperm(len(LINS)).tolist()
-for i, mm in enumerate(LINS): mm._sig = orig[perm[i]]
+# control: shuffle each matrix's identity (signature AND role) -> if CE unchanged, C ignores it
+o_sig = [mm._sig for mm in LINS]; o_role = [mm._role for mm in LINS]
+perm = torch.randperm(len(LINS)).tolist()
+for i, mm in enumerate(LINS): mm._sig, mm._role = o_sig[perm[i]], o_role[perm[i]]
 C.install(L_FULL); mm_ce = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
-for i, mm in enumerate(LINS): mm._sig = orig[i]
+for i, mm in enumerate(LINS): mm._sig, mm._role = o_sig[i], o_role[i]
 C.install(L_FULL); bb = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
-print(f'\ncontrol — shuffled-signature masked-CE@0.5: {mm_ce:.2f} (vs B* {bb:.2f}; equal ⇒ C ignores signatures)')
+print(f'\ncontrol — shuffled-identity masked-CE@0.5: {mm_ce:.2f} (vs B* {bb:.2f}; equal ⇒ C ignores it)')
 
 # %% ---- cell ----
 from safetensors.torch import save_file
 pack = {'mercury.mask_embedding': mrow.detach().float().cpu()}
 with torch.no_grad():
     for i, mm in enumerate(LINS):
-        A = (C.M @ C.enc(mm._sig)).view(SUB, SUB)[:mm._r, :mm._r]
+        A = (C.M @ C._z(mm)).view(SUB, SUB)[:mm._r, :mm._r]
         pack[f'lin{i}.UA'] = (mm._Ud.float().cpu() @ A.cpu())
         pack[f'lin{i}.V'] = mm._Vd.float().cpu()
 path = ('/kaggle/working/' if os.path.isdir('/kaggle/working') else '') + \
