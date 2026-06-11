@@ -44,12 +44,17 @@ DEV0 = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 print('PILOT' if PILOT else '9B RUN', '| model', MODEL_ID, '| GPUs', torch.cuda.device_count())
 
 # %% ---- cell ----
+# Kaggle ships transformers 5.0.0 which predates model_type 'qwen3_5' -> upgrade first.
+# (Runs before the first `import transformers`, so no kernel restart is needed.)
+import subprocess, sys
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-U',
+                'transformers>=5.8', 'accelerate'], check=True)
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import transformers
 print('transformers', transformers.__version__)
-tok = AutoTokenizer.from_pretrained(MODEL_ID)
+tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, torch_dtype=torch.float16,
+    MODEL_ID, torch_dtype=torch.float16, trust_remote_code=True,
     device_map='balanced' if torch.cuda.device_count() > 1 else DEV0,
     attn_implementation='eager')        # eager: honors arbitrary 4D float masks (phase-7 lesson)
 model.eval()
