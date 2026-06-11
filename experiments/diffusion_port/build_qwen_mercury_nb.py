@@ -69,7 +69,7 @@ cells.append(code(
 "N_GEN    = 256 if PILOT else 512",
 "N_HELD   = 32  if PILOT else 48",
 "SEQ_LEN  = 160",
-"C_STEPS  = 2000 if PILOT else 2400",
+"C_STEPS  = 2000 if PILOT else 1500   # 9B step ~8-10s on 2xT4 -> 1500 keeps the session ~5-6h",
 "C_BS     = 4   if PILOT else 2",
 "LR       = 5e-4        # peak lr (warmup 100) -- higher than supra's 3e-4 to fit more in-budget",
 "SUB      = 48          # SVD-frame correction subspace (A is SUB x SUB)",

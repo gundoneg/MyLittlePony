@@ -259,3 +259,36 @@ transformers in the dev container). Full 9B run ≈ 2.5–3 h. Deliverable = a t
 (per-layer UA/V factors + [MASK] embedding + C) that applies B* to the stock checkpoint
 anywhere. Per the donor-bounded-fluency finding, a strong 9B donor should also generate far
 better text if the translation carries.
+
+## Qwen3.5-0.8B pilot v4 — math-grounded fixes CONFIRMED (the decisive pilot)
+
+After the v2 control failed to separate (4.83 vs 5.12), a measured re-analysis (on supra50m,
+same signature construction) found three causes: input degeneracy (signatures identify a
+matrix's role at only 33-39% LOO; spectra near-universal, within 0.9954 vs cross 0.9900),
+output capacity (one shared M = a single d_z-dim correction subspace; supra's decisive
+control used per-type generators), and weak control statistics (one unpaired draw,
+delta=0.29 @ SE~0.08; depth_frac the only high-variance channel). v4 = per-role generators +
+role embeddings + paired-mask 4-arm attribution + k=5 dual-granularity controls.
+
+**Result (Qwen3.5-0.8B, 2000 steps, donor AR = 0.96):**
+
+| paired masked-CE | floor | mask-row-only | deltas-only | full B* |
+|---|---|---|---|---|
+| t=0.3 | 6.44 | 6.46 | **3.39** | 3.39 |
+| t=0.5 | 7.42 | 7.44 | **4.28** | 4.27 |
+| t=0.7 | 8.71 | 8.76 | **5.07** | 5.07 |
+| t=0.9 | 10.58 | 10.65 | **6.15** | 6.15 |
+
+- **Attribution: 100% of the gain is the weight translation** (mask-row contributes ~0;
+  deltas-only == full B*). Reconstruction 36.1% vs floor 5.9%, semantically readable.
+- **Controls: cross-role shuffle 8.92 ± 0.76 vs B* 4.27 (Δ=+4.65)** — decisive (v2: Δ=-0.29);
+  within-role 4.40 ± 0.03 (Δ=+0.12 ≈ 4σ) — C also uses finer-than-role info, modestly, as the
+  spectra-universality analysis predicted.
+- Probe: deltas on 0..22 only = 3.79 < all-24 = 4.27 — the never-seen-as-interior last layer
+  replicates the supra pattern; at apply time the last layer's delta can be dropped.
+- Generation still degenerate (expected: only 1/4 of layers can go bidirectional — DeltaNet is
+  causal by construction — and the budget is ~0.9 supervision-tokens/param).
+
+**Verdict:** the per-Linear, architecture-agnostic translator C works on a real hybrid
+Gated-DeltaNet model with fully attributed gains and a decisive mechanism control. Next:
+PILOT=False -> Qwen3.5-9B (C_STEPS 1500 to fit the session).

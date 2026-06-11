@@ -1,5 +1,5 @@
-"""Qwen3.5 -> Mercury-2 diffusion by translator C (v4). Kaggle GPU T4 x2 + INTERNET ON.
-PILOT=True first, then PILOT=False for 9B."""
+"""Qwen3.5 -> Mercury-2 diffusion by translator C (v4, pilot-confirmed). Kaggle GPU T4 x2 + INTERNET ON.
+PILOT pilot done; set PILOT=False for the 9B port (~5-6h)."""
 
 
 # # Qwen3.5 → Mercury-2 diffusion LM **by the translator C** (architecture-agnostic, at scale)
@@ -35,7 +35,7 @@ MODEL_ID = 'Qwen/Qwen3.5-0.8B' if PILOT else 'Qwen/Qwen3.5-9B'
 N_GEN    = 256 if PILOT else 512
 N_HELD   = 32  if PILOT else 48
 SEQ_LEN  = 160
-C_STEPS  = 2000 if PILOT else 2400
+C_STEPS  = 2000 if PILOT else 1500   # 9B step ~8-10s on 2xT4 -> 1500 keeps the session ~5-6h
 C_BS     = 4   if PILOT else 2
 LR       = 5e-4        # peak lr (warmup 100) -- higher than supra's 3e-4 to fit more in-budget
 SUB      = 48          # SVD-frame correction subspace (A is SUB x SUB)
