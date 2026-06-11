@@ -247,3 +247,15 @@ capacity (64×64), KD soft targets, and a sampler tuned past the filler trap and
 loops. What would lift it further: a stronger donor (the method is donor-bounded), a larger
 self-generated corpus/training budget, and the BASELINE continued-training ceiling for
 calibration.
+
+## Scale-up: Qwen3.5-9B (`qwen_mercury_port.ipynb`)
+
+The same method at 9B on 2×T4: transformers-based truncated-stack loop (Qwen3.5 quirks
+handled by HF code), fp16 sharded over both GPUs, **deltas applied via forward hooks** (the
+9B weights are never even materialized-modified), `svd_lowrank` caches, top-k KD targets
+(vocab 152K), WARM omitted (Adam on 9B cannot fit T4s). PILOT mode (Qwen3.5-0.8B, ~15–20 min)
+validates the pipeline first — there is no local smoke possible at this scale (no
+transformers in the dev container). Full 9B run ≈ 2.5–3 h. Deliverable = a translation pack
+(per-layer UA/V factors + [MASK] embedding + C) that applies B* to the stock checkpoint
+anywhere. Per the donor-bounded-fluency finding, a strong 9B donor should also generate far
+better text if the translation carries.
