@@ -1,5 +1,5 @@
-"""Qwen3.5 -> Mercury-2 diffusion by translator C (architecture-agnostic). Kaggle GPU T4 x2 + Internet.
-PILOT=True first (Qwen3.5-0.8B), then PILOT=False for 9B. From qwen_mercury_port.ipynb."""
+"""Qwen3.5 -> Mercury-2 diffusion by translator C (v4: per-role generators, attribution, sound controls).
+Kaggle GPU T4 x2 + Internet. PILOT=True first, then PILOT=False for 9B."""
 
 
 # # Qwen3.5 → Mercury-2 diffusion LM **by the translator C** (architecture-agnostic, at scale)
@@ -268,30 +268,39 @@ def _delta_hook(mod, inp, out):
     return out
 for mm in LINS: mm.register_forward_hook(_delta_hook)
 
+PRESENT_ROLES = sorted({mm._role for mm in LINS})
+ROLE_SLOT = {r: i for i, r in enumerate(PRESENT_ROLES)}
+
 class TranslatorC(nn.Module):
-    """Per-matrix: emit an SVD-frame correction from the matrix's signature + a learned
-    role embedding (so C distinguishes in_proj_qkv vs gate_proj vs o_proj ... rather than
-    averaging over all 186 heterogeneous matrices) + the layer type (linear/full)."""
+    """v4 (math-grounded): PER-ROLE output generators M_role -- with one shared M all
+    corrections live in a single d_z-dim subspace of R^{sub^2}; per-role generators give
+    each role its own subspace (this is the structure that produced the decisive control
+    separation on supra). Input: signature + learned role embedding (v2 signatures identify
+    the role at only ~33-39% LOO accuracy -- spectra of trained matrices are near-universal,
+    within-role cos 0.9954 vs cross-role 0.9900 -- so explicit identity is required)."""
     def __init__(self, d_z=D_Z, sub=SUB, h=160):
         super().__init__(); self.sub = sub
         self.role_emb = nn.Embedding(NROLE, R_EMB)
         self.enc = nn.Sequential(nn.Linear(SIG_DIM + R_EMB, h), nn.SiLU(),
                                  nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
-        self.M = nn.Parameter(torch.zeros(sub * sub, d_z))     # zero-init => B == floor
+        self.M = nn.ParameterDict({str(r): nn.Parameter(torch.zeros(sub * sub, d_z))
+                                   for r in PRESENT_ROLES})    # zero-init => B == floor
         self.mask_logits = nn.Parameter(torch.zeros(V))
     def mask_row(self): return self.mask_logits.softmax(0).to(E_W.device, E_W.dtype) @ E_W
     def _z(self, mm):
         re = self.role_emb(torch.tensor(mm._role, device=mm._sig.device))
         return self.enc(torch.cat([mm._sig, re]))
-    def install(self, Lt):
+    def _A(self, mm):
+        return (self.M[str(mm._role)] @ self._z(mm)).view(self.sub, self.sub)
+    def install(self, Lt, deltas=True):
         for mm in LINS:
-            if mm._layer >= Lt: mm._on = False; continue
-            A = (self.M @ self._z(mm)).view(self.sub, self.sub)
+            if not deltas or mm._layer >= Lt: mm._on = False; continue
+            A = self._A(mm)
             mm._A = A[:mm._r, :mm._r].to(mm.weight.device, mm.weight.dtype); mm._on = True
     def uninstall(self):
         for mm in LINS: mm._on = False
 C = TranslatorC().to(DEV0)
-print('C params:', sum(p.numel() for p in C.parameters()))
+print(f'C params: {sum(p.numel() for p in C.parameters())} | per-role generators: {len(PRESENT_ROLES)}')
 
 # %% ---- cell ----
 opt = torch.optim.AdamW(C.parameters(), lr=LR)
@@ -327,15 +336,35 @@ print('C trained — the donor was never trained, only C was')
 with torch.no_grad(): mrow = C.mask_row(); mean_row = E_W.float().mean(0).to(E_W.dtype)
 def fnB(i): return run_stack(i, L_FULL, causal=False, mask_row=mrow)
 def fn0(i): return run_stack(i, L_FULL, causal=False, mask_row=mean_row)
+
+@torch.no_grad()
+def masked_ce_paired(fn, ids, t_val, n=16, seed=777):
+    """PAIRED evaluation: a fixed mask draw shared by every condition (cuts the variance of
+    between-condition differences -- the F3 statistical fix)."""
+    g = torch.Generator(device='cpu').manual_seed(seed)
+    x0 = ids[:n]
+    noise = torch.rand(x0.shape, generator=g).to(x0.device)
+    m = noise < t_val
+    if (~m.any(dim=1)).any(): m[:, 0] = True
+    x_t = torch.where(m, torch.full_like(x0, MASK_ID), x0)
+    return F.cross_entropy(fn(x_t)[m].float(), x0[m]).item()
+
 with torch.no_grad():
     al = run_stack(held_ids[:8, :-1], L_FULL, causal=True)
     ar = F.cross_entropy(al.reshape(-1, V).float(), held_ids[:8, 1:].reshape(-1)).item(); del al
 print(f'uniform ln(V) = {math.log(V):.2f} | donor AR next-token CE (held) = {ar:.2f}')
-print('\nheld masked-CE:    floor(raw bidir)   B*=C(donor)')
+
+# ---- F2: ATTRIBUTION -- decompose the floor->B* gain (paired masks) ----
+print('\nheld masked-CE (paired masks):  floor | mask-row-only | deltas-only | full B*')
 for tv in (0.3, 0.5, 0.7, 0.9):
-    f0 = masked_ce_at(fn0, held_ids, tv)
-    C.install(L_FULL); fb = masked_ce_at(fnB, held_ids, tv); C.uninstall()
-    print(f'  t={tv}:   {f0:7.2f}      {fb:7.2f}')
+    C.uninstall()
+    a_fl = masked_ce_paired(fn0, held_ids, tv)                         # nothing translated
+    a_mr = masked_ce_paired(fnB, held_ids, tv)                         # mask row only
+    C.install(L_FULL)
+    a_do = masked_ce_paired(fn0, held_ids, tv)                         # deltas only
+    a_bb = masked_ce_paired(fnB, held_ids, tv)                         # full B*
+    C.uninstall()
+    print(f'  t={tv}:   {a_fl:6.2f} | {a_mr:6.2f} | {a_do:6.2f} | {a_bb:6.2f}')
 
 x0 = held_ids[:4]; x_c, m = forward_mask(x0, torch.full((x0.shape[0],), 0.25, device=x0.device))
 for name, fn, ins in (('floor', fn0, False), ('B*', fnB, True)):
@@ -359,21 +388,44 @@ for b in range(2):
     print(f'\nprompt {b}   :', repr(tok.decode(prompt[b])))
     print('semi-AR cont:', repr(tok.decode(g4[b, 32:].clamp_max(V - 1))))
 
-# control: shuffle each matrix's identity (signature AND role) -> if CE unchanged, C ignores it
+# ---- F3: statistically sound controls -- paired masks, k=5 draws, TWO granularities ----
 o_sig = [mm._sig for mm in LINS]; o_role = [mm._role for mm in LINS]
-perm = torch.randperm(len(LINS)).tolist()
-for i, mm in enumerate(LINS): mm._sig, mm._role = o_sig[perm[i]], o_role[perm[i]]
-C.install(L_FULL); mm_ce = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
-for i, mm in enumerate(LINS): mm._sig, mm._role = o_sig[i], o_role[i]
-C.install(L_FULL); bb = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
-print(f'\ncontrol — shuffled-identity masked-CE@0.5: {mm_ce:.2f} (vs B* {bb:.2f}; equal ⇒ C ignores it)')
+def restore():
+    for i, mm in enumerate(LINS): mm._sig, mm._role = o_sig[i], o_role[i]
+def ctrl_eval():
+    C.install(L_FULL); v = masked_ce_paired(fnB, held_ids, 0.5); C.uninstall(); return v
+
+C.install(L_FULL); bb = masked_ce_paired(fnB, held_ids, 0.5); C.uninstall()
+res = {}
+for mode in ('cross-role', 'within-role'):
+    vals = []
+    for k in range(5):
+        g = torch.Generator().manual_seed(100 + k)
+        if mode == 'cross-role':                       # destroy role AND signature identity
+            perm = torch.randperm(len(LINS), generator=g).tolist()
+            for i, mm in enumerate(LINS): mm._sig, mm._role = o_sig[perm[i]], o_role[perm[i]]
+        else:                                          # permute only WITHIN each role class
+            for r in set(o_role):
+                idxs = [i for i in range(len(LINS)) if o_role[i] == r]
+                pr = torch.randperm(len(idxs), generator=g).tolist()
+                for a, i in enumerate(idxs): LINS[i]._sig = o_sig[idxs[pr[a]]]
+        vals.append(ctrl_eval()); restore()
+    v = torch.tensor(vals); res[mode] = v
+    print(f'control {mode:>11}-shuffle masked-CE@0.5: {v.mean():.2f} ± {v.std():.2f}  '
+          f'(B* {bb:.2f}; Δ={v.mean()-bb:+.2f})')
+print('  reading: cross-role >> B* => C uses ROLE identity; within-role > B* => C also uses',
+      'finer-than-role (spectra/depth) information')
+
+# probe: deltas on layers seen in truncation training only (0..L-2) vs all
+C.install(L_FULL - 1); p1 = masked_ce_paired(fnB, held_ids, 0.5); C.uninstall()
+print(f'probe — deltas on 0..{L_FULL-2} only: {p1:.2f} (vs all {bb:.2f})')
 
 # %% ---- cell ----
 from safetensors.torch import save_file
 pack = {'mercury.mask_embedding': mrow.detach().float().cpu()}
 with torch.no_grad():
     for i, mm in enumerate(LINS):
-        A = (C.M @ C._z(mm)).view(SUB, SUB)[:mm._r, :mm._r]
+        A = C._A(mm)[:mm._r, :mm._r]
         pack[f'lin{i}.UA'] = (mm._Ud.float().cpu() @ A.cpu())
         pack[f'lin{i}.V'] = mm._Vd.float().cpu()
 path = ('/kaggle/working/' if os.path.isdir('/kaggle/working') else '') + \

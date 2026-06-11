@@ -333,14 +333,24 @@ for mm in LINS:
     mm.register_forward_hook(_delta_hook)
 
 
+PRESENT_ROLES = sorted({mm._role for mm in LINS})
+
+
 class TranslatorC(nn.Module):
+    """v4: PER-ROLE output generators (one shared M confines all corrections to a single
+    d_z-dim subspace; per-role generators were the structure behind the decisive control
+    separation on supra). Input: signature + learned role embedding (v2 signatures identify
+    a matrix's role at only ~33-39% LOO accuracy: trained-matrix spectra are near-universal,
+    within-role cos 0.9954 vs cross-role 0.9900)."""
+
     def __init__(self, d_z=ARGS.d_z, sub=ARGS.sub, h=160):
         super().__init__()
         self.sub = sub
         self.role_emb = nn.Embedding(NROLE, R_EMB)
         self.enc = nn.Sequential(nn.Linear(SIG_DIM + R_EMB, h), nn.SiLU(),
                                  nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
-        self.M = nn.Parameter(torch.zeros(sub * sub, d_z))
+        self.M = nn.ParameterDict({str(r): nn.Parameter(torch.zeros(sub * sub, d_z))
+                                   for r in PRESENT_ROLES})
         self.mask_logits = nn.Parameter(torch.zeros(V))
 
     def mask_row(self):
@@ -349,12 +359,15 @@ class TranslatorC(nn.Module):
     def _z(self, mm):
         return self.enc(torch.cat([mm._sig, self.role_emb(torch.tensor(mm._role))]))
 
-    def install(self, Lt):
+    def _A(self, mm):
+        return (self.M[str(mm._role)] @ self._z(mm)).view(self.sub, self.sub)
+
+    def install(self, Lt, deltas=True):
         for mm in LINS:
-            if mm._layer >= Lt:
+            if not deltas or mm._layer >= Lt:
                 mm._on = False
                 continue
-            A = (self.M @ self._z(mm)).view(self.sub, self.sub)
+            A = self._A(mm)
             mm._A = A[:mm._r, :mm._r]
             mm._on = True
 
@@ -421,16 +434,34 @@ with torch.no_grad():
 fnB = lambda i: run_stack(i, L_FULL, causal=False, mask_row=mrow)
 fn0 = lambda i: run_stack(i, L_FULL, causal=False, mask_row=mean_row)
 
+
+@torch.no_grad()
+def masked_ce_paired(fn, ids, t_val, n=8, seed=777):
+    """Paired evaluation: one fixed mask draw shared by all conditions."""
+    g = torch.Generator().manual_seed(seed)
+    x0 = ids[:n]
+    m = torch.rand(x0.shape, generator=g) < t_val
+    if (~m.any(dim=1)).any():
+        m[:, 0] = True
+    x_t = torch.where(m, torch.full_like(x0, MASK_ID), x0)
+    return F.cross_entropy(fn(x_t)[m].float(), x0[m]).item()
+
+
 with torch.no_grad():
     al = run_stack(held_ids[:4, :-1], L_FULL, causal=True)
     ar = F.cross_entropy(al.reshape(-1, V).float(), held_ids[:4, 1:].reshape(-1)).item()
     del al
 print(f"\nuniform ln(V) = {math.log(V):.2f} | donor AR next-token CE (held) = {ar:.2f}")
-print("held masked-CE:    floor(raw bidir)   B*=C(donor)")
+print("held masked-CE (paired):  floor | mask-row-only | deltas-only | full B*")
 for tv in (0.3, 0.5, 0.7, 0.9):
-    f0 = masked_ce_at(fn0, held_ids, tv)
-    C.install(L_FULL); fb = masked_ce_at(fnB, held_ids, tv); C.uninstall()
-    print(f"  t={tv}:   {f0:7.2f}      {fb:7.2f}")
+    C.uninstall()
+    a_fl = masked_ce_paired(fn0, held_ids, tv)
+    a_mr = masked_ce_paired(fnB, held_ids, tv)
+    C.install(L_FULL)
+    a_do = masked_ce_paired(fn0, held_ids, tv)
+    a_bb = masked_ce_paired(fnB, held_ids, tv)
+    C.uninstall()
+    print(f"  t={tv}:   {a_fl:6.2f} | {a_mr:6.2f} | {a_do:6.2f} | {a_bb:6.2f}")
 
 x0 = held_ids[:2]
 x_c, m = forward_mask(x0, torch.full((x0.shape[0],), 0.25))
@@ -458,22 +489,42 @@ print("\nprompt      :", repr(tok.decode(prompt[0])))
 print("semi-AR cont:", repr(tok.decode(g4[0, 24:].clamp_max(V - 1))))
 
 o_sig = [mm._sig for mm in LINS]; o_role = [mm._role for mm in LINS]
-perm = torch.randperm(len(LINS)).tolist()
-for i, mm in enumerate(LINS):
-    mm._sig, mm._role = o_sig[perm[i]], o_role[perm[i]]
-C.install(L_FULL); mm_ce = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
-for i, mm in enumerate(LINS):
-    mm._sig, mm._role = o_sig[i], o_role[i]
-C.install(L_FULL); bb = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
-print(f"\ncontrol — shuffled-identity masked-CE@0.5: {mm_ce:.2f} "
-      f"(vs B* {bb:.2f}; equal => C ignores it)")
+
+
+def restore():
+    for i, mm in enumerate(LINS):
+        mm._sig, mm._role = o_sig[i], o_role[i]
+
+
+C.install(L_FULL); bb = masked_ce_paired(fnB, held_ids, 0.5); C.uninstall()
+for mode in ("cross-role", "within-role"):
+    vals = []
+    for k in range(5):
+        g = torch.Generator().manual_seed(100 + k)
+        if mode == "cross-role":
+            perm = torch.randperm(len(LINS), generator=g).tolist()
+            for i, mm in enumerate(LINS):
+                mm._sig, mm._role = o_sig[perm[i]], o_role[perm[i]]
+        else:
+            for r in set(o_role):
+                idxs = [i for i in range(len(LINS)) if o_role[i] == r]
+                pr = torch.randperm(len(idxs), generator=g).tolist()
+                for a, i in enumerate(idxs):
+                    LINS[i]._sig = o_sig[idxs[pr[a]]]
+        C.install(L_FULL); vals.append(masked_ce_paired(fnB, held_ids, 0.5)); C.uninstall()
+        restore()
+    v = torch.tensor(vals)
+    print(f"control {mode:>11}-shuffle masked-CE@0.5: {v.mean():.2f} ± {v.std():.2f} "
+          f"(B* {bb:.2f}; d={v.mean()-bb:+.2f})")
+C.install(L_FULL - 1); p1 = masked_ce_paired(fnB, held_ids, 0.5); C.uninstall()
+print(f"probe — deltas on 0..{L_FULL-2} only: {p1:.2f} (vs all {bb:.2f})")
 
 # ---------------- save translation pack ----------------
 from safetensors.torch import save_file
 pack = {"mercury.mask_embedding": mrow.detach().float()}
 with torch.no_grad():
     for i, mm in enumerate(LINS):
-        A = (C.M @ C._z(mm)).view(ARGS.sub, ARGS.sub)[:mm._r, :mm._r]
+        A = C._A(mm)[:mm._r, :mm._r]
         pack[f"lin{i}.UA"] = (mm._Ud @ A).contiguous()
         pack[f"lin{i}.V"] = mm._Vd.contiguous()
 path = os.path.join(ARGS.workdir, "mercury_pack.safetensors")
