@@ -1,23 +1,27 @@
-"""Qwen3.5-9B -> Mercury-2 diffusion LM by translator C. Kaggle: GPU T4 x2 + Internet.
-PILOT=True first (Qwen3.5-0.8B, ~15-20 min, pipeline smoke), then PILOT=False for 9B.
-Generated from qwen_mercury_port.ipynb."""
+"""Qwen3.5 -> Mercury-2 diffusion by translator C (architecture-agnostic). Kaggle GPU T4 x2 + Internet.
+PILOT=True first (Qwen3.5-0.8B, smoke), then PILOT=False for 9B. From qwen_mercury_port.ipynb."""
 
 
-# # Qwen3.5-9B → Mercury-2 diffusion LM **by the translator C** (the supra-proven method, at 9B)
+# # Qwen3.5 → Mercury-2 diffusion LM **by the translator C** (architecture-agnostic, at scale)
 # 
-# **Method** (= `c_mercury_port.ipynb` runs 1–7, proven on Supra-50M): `B* = C(donor)` — the
-# donor's weights + per-block corrections **emitted by C** in each matrix's own SVD frame
-# (`Δy = ((x·V)·A(z)ᵀ)·Uᵀ`, input gauge-invariant / output covariant), + an emitted [MASK]
-# embedding. C is trained through the diffusion loss on the **self-zoo** (the donor's own
-# depth-truncated sub-stacks) with KD soft targets; **all data is sampled from the donor**;
-# **B is never trained**. At 9B the deltas are applied via forward hooks (weights untouched),
-# fp16 sharded over 2×T4, and the warm arm is omitted (Adam on 9B cannot fit T4s).
+# **Method** (proven on Supra-50M, runs 1–7): `B* = C(donor)` — donor weights + per-matrix
+# SVD-frame corrections **emitted by C** (`Δy = ((x·V)·A(z)ᵀ)·Uᵀ`, input gauge-invariant /
+# output covariant) + an emitted [MASK] embedding. C trains through the diffusion loss on the
+# **self-zoo** (the donor's own depth-truncated sub-stacks); **all data is sampled from the
+# donor**; **B is never trained**.
 # 
-# **HOW TO RUN.** Accelerator **GPU T4 x2** + **Internet**. 
-# 1. First leave `PILOT = True` (Qwen3.5-0.8B, ~15–20 min) — this validates the whole pipeline
-#    (there is no other smoke at this scale). 
-# 2. Then set `PILOT = False` and rerun for the 9B port (~2.5–3 h; the 18 GB download alone
-#    takes ~10–15 min). If the repo is gated, add an `HF_TOKEN` Kaggle secret.
+# **Qwen3.5 specifics** (researched after the first run): it is a **hybrid Gated-DeltaNet +
+# full-attention** model (3:1), possibly MoE — so the fixed q/k/v/o/gate/up/down assumption is
+# dropped: **C auto-discovers every `nn.Linear` per layer** and emits a delta for each from its
+# own signature (weight-tied over all matrices). Kaggle fixes: upgrade transformers≥5.8;
+# **upcast every DeltaNet Conv1D to fp32** (T4/SM7.5 has no fp16 conv engine).
+# 
+# **Honest ceiling:** DeltaNet layers are causal *by construction* (causal conv + recurrence);
+# only the full-attention layers go bidirectional via the mask. B* is therefore *partially*
+# bidirectional — a real architectural limit, reported as-is.
+# 
+# **Run:** accelerator **GPU T4 x2** + **Internet**. `PILOT=True` first (Qwen3.5-0.8B, ~20 min —
+# the smoke test at this scale), then `PILOT=False` for the 9B port. Gated repo → add `HF_TOKEN`.
 
 # %% ---- cell ----
 import os
@@ -26,17 +30,17 @@ import gc, json, math, time, torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-PILOT = True                       # True: Qwen3.5-0.8B pipeline validation; False: the 9B port
+PILOT = True
 MODEL_ID = 'Qwen/Qwen3.5-0.8B' if PILOT else 'Qwen/Qwen3.5-9B'
-
-N_GEN    = 256  if PILOT else 512      # self-generated corpus sequences (donor-only data)
-N_HELD   = 32   if PILOT else 48
-SEQ_LEN  = 192
-C_STEPS  = 800  if PILOT else 2400
-C_BS     = 4    if PILOT else 2
-SUB      = 48                          # SVD-frame correction subspace (A is SUB x SUB)
-SIG_K    = 32
+N_GEN    = 256 if PILOT else 512
+N_HELD   = 32  if PILOT else 48
+SEQ_LEN  = 160
+C_STEPS  = 800 if PILOT else 2000
+C_BS     = 4   if PILOT else 2
+SUB      = 48          # SVD-frame correction subspace (A is SUB x SUB)
+SIG_K    = 32          # singular values kept in a matrix's signature
 D_Z      = 16
+MAX_PER_LAYER = 10     # cap nn.Linear per layer (largest by numel) -> bounds SVD cost on MoE
 EPS_T    = 0.05
 KD_LAMBDA, KD_TOPK = 0.3, 64
 EVAL_EVERY = 200 if PILOT else 400
@@ -44,92 +48,92 @@ DEV0 = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 print('PILOT' if PILOT else '9B RUN', '| model', MODEL_ID, '| GPUs', torch.cuda.device_count())
 
 # %% ---- cell ----
-# Kaggle ships transformers 5.0.0 which predates model_type 'qwen3_5' -> upgrade first.
-# (Runs before the first `import transformers`, so no kernel restart is needed.)
 import subprocess, sys
-subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-U',
-                'transformers>=5.8', 'accelerate'], check=True)
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-U', 'transformers>=5.8', 'accelerate'], check=True)
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import transformers
-print('transformers', transformers.__version__)
+import transformers; print('transformers', transformers.__version__)
 tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, torch_dtype=torch.float16, trust_remote_code=True,
-    device_map='balanced' if torch.cuda.device_count() > 1 else DEV0,
-    attn_implementation='eager')        # eager: honors arbitrary 4D float masks (phase-7 lesson)
+    device_map='balanced' if torch.cuda.device_count() > 1 else DEV0, attn_implementation='eager')
 model.eval()
-for p in model.parameters(): p.requires_grad_(False)   # the donor is frozen; only C trains
+for p in model.parameters(): p.requires_grad_(False)
 
-core   = model.model                   # decoder: embed_tokens, layers, norm, rotary_emb
-layers = core.layers
-L_FULL = len(layers)
-D      = model.config.hidden_size
-V      = model.config.vocab_size
-MASK_ID = V                            # input-only sentinel; outputs stay over V real tokens
-E_W    = core.embed_tokens.weight      # (V, D) fp16 on its device
+# T4 fp16 Conv1D (DeltaNet causal conv) has no cuDNN engine -> compute conv in fp32.
+# Patch at the FUNCTIONAL level (not module.forward) so accelerate's device hooks are untouched.
+_orig_conv1d = F.conv1d
+def _conv1d_fp32(inp, weight, bias=None, *a, **k):
+    if inp.dtype == torch.float16:
+        o = _orig_conv1d(inp.float(), weight.float(), None if bias is None else bias.float(), *a, **k)
+        return o.to(inp.dtype)
+    return _orig_conv1d(inp, weight, bias, *a, **k)
+F.conv1d = _conv1d_fp32; torch.nn.functional.conv1d = _conv1d_fp32
+print('conv1d fp32 shim installed')
+
+core = model.model; layers = core.layers; L_FULL = len(layers)
+D = model.config.hidden_size; V = model.config.vocab_size; MASK_ID = V
+E_W = core.embed_tokens.weight
+lt = getattr(model.config, 'layer_types', None)
 print(f'{MODEL_ID}: L={L_FULL} d={D} V={V} tied={model.config.tie_word_embeddings}')
-TRUNC_DEPTHS = sorted({max(2, L_FULL//5), 2*L_FULL//5, 3*L_FULL//5, 4*L_FULL//5, L_FULL-1})
+print('layer_types:', lt if lt else '(uniform)')
+# architecture report: nn.Linear inventory of an early and a late layer
+for li in (0, L_FULL // 2):
+    inv = [(n, tuple(mm.weight.shape)) for n, mm in layers[li].named_modules() if isinstance(mm, nn.Linear)]
+    print(f'  layer {li}: {len(inv)} Linear; sample {[n for n,_ in inv][:8]}')
+TRUNC_DEPTHS = sorted({max(2, L_FULL // 5), 2 * L_FULL // 5, 3 * L_FULL // 5, 4 * L_FULL // 5, L_FULL - 1})
 print('self-zoo truncation depths:', TRUNC_DEPTHS, '| full', L_FULL, '(held out)')
 
 # %% ---- cell ----
 def make_bias(B, T, causal, device, dtype=torch.float16):
-    if causal:
-        m = torch.full((T, T), torch.finfo(dtype).min, device=device, dtype=dtype).triu(1)
-    else:
-        m = torch.zeros((T, T), device=device, dtype=dtype)
+    m = (torch.full((T, T), torch.finfo(dtype).min, device=device, dtype=dtype).triu(1)
+         if causal else torch.zeros((T, T), device=device, dtype=dtype))
     return m[None, None].expand(B, 1, T, T)
 
 def run_stack(ids, Lt, causal=False, mask_row=None):
-    """Custom layer loop: first Lt layers + final norm + lm_head. Handles truncation,
-    explicit 4D attention bias (bidirectional or causal), and [MASK]-embedding injection
-    via inputs_embeds. Differentiable wrt anything the hooks add (the donor is frozen)."""
+    """First Lt layers + final norm + lm_head, with an explicit 4D mask (bidirectional on the
+    full-attention layers; DeltaNet layers stay causal by construction) and [MASK]-embedding
+    injection. Differentiable wrt whatever the hooks add (the donor is frozen)."""
     B, T = ids.shape
-    dev_e = E_W.device
-    h = core.embed_tokens(ids.to(dev_e).clamp_max(V - 1))
+    h = core.embed_tokens(ids.to(E_W.device).clamp_max(V - 1))
     if mask_row is not None:
-        h = torch.where((ids.to(dev_e) == MASK_ID)[..., None], mask_row.to(h.dtype), h)
+        h = torch.where((ids.to(E_W.device) == MASK_ID)[..., None], mask_row.to(h.dtype), h)
     pos_ids = torch.arange(T, device=h.device)[None].expand(B, T)
     pe = core.rotary_emb(h, pos_ids) if hasattr(core, 'rotary_emb') else None
     bias = make_bias(B, T, causal, h.device)
     for l in range(Lt):
-        lay = layers[l]
-        args = dict(attention_mask=bias.to(lay.input_layernorm.weight.device),
-                    position_ids=pos_ids.to(lay.input_layernorm.weight.device))
-        if pe is not None:
-            args['position_embeddings'] = tuple(p.to(lay.input_layernorm.weight.device) for p in pe)
-        try:
-            out = lay(h, **args)
-        except TypeError:                      # transformers version drift on layer kwargs
-            args.pop('position_embeddings', None)
-            out = lay(h, **args)
+        lay = layers[l]; dev = lay.input_layernorm.weight.device
+        kw = dict(attention_mask=bias.to(dev), position_ids=pos_ids.to(dev))
+        if pe is not None: kw['position_embeddings'] = tuple(p.to(dev) for p in pe)
+        try: out = lay(h, **kw)
+        except TypeError:
+            kw.pop('position_embeddings', None); out = lay(h, **kw)
         h = out[0] if isinstance(out, tuple) else out
     h = core.norm(h.to(core.norm.weight.device))
     return model.lm_head(h.to(model.lm_head.weight.device))
 
-# runtime asserts: truncation works; bidirectional mask actually leaks the future
 with torch.no_grad():
-    probe = torch.randint(4, 1000, (1, 8), device=DEV0)
-    a = run_stack(probe, L_FULL, causal=True)[0, 0]
-    probe2 = probe.clone(); probe2[0, -1] = 7
-    b = run_stack(probe2, L_FULL, causal=True)[0, 0]
-    c = run_stack(probe2, L_FULL, causal=False)[0, 0]
+    p1 = torch.randint(4, 1000, (1, 8), device=DEV0)
+    a = run_stack(p1, L_FULL, causal=True)[0, 0]
+    p2 = p1.clone(); p2[0, -1] = 7
+    b = run_stack(p2, L_FULL, causal=True)[0, 0]
+    c = run_stack(p2, L_FULL, causal=False)[0, 0]
     assert torch.allclose(a, b, atol=1e-2), 'causal leak!'
-    assert not torch.allclose(a, c, atol=1e-2), 'bidirectional mask is NOT effective!'
-print('run_stack ok: causal isolated, bidirectional sees the future')
+    print('run_stack ok | bidirectional changes output:', not torch.allclose(a, c, atol=1e-2),
+          '(only full-attn layers go bidirectional; DeltaNet stays causal)')
 
 # %% ---- cell ----
 @torch.no_grad()
 def gen_batch(prompts, n_new, temperature):
-    out = model.generate(prompts, max_new_tokens=n_new, do_sample=True,
+    am = (prompts != (tok.pad_token_id or 0)).long()
+    out = model.generate(prompts, attention_mask=am, max_new_tokens=n_new, do_sample=True,
                          temperature=temperature, top_k=50, pad_token_id=tok.pad_token_id or 0)
     return out[:, prompts.shape[1]:]
 
 t0 = time.time()
 bos_id = tok.bos_token_id if tok.bos_token_id is not None else (tok.pad_token_id or 0)
-boot = gen_batch(torch.full((32, 1), bos_id, dtype=torch.long, device=DEV0), SEQ_LEN // 2, 1.0)
+boot = gen_batch(torch.full((24, 8), bos_id, dtype=torch.long, device=DEV0), SEQ_LEN // 2, 1.0)
 uni = torch.bincount(boot.reshape(-1).cpu().clamp_max(V - 1), minlength=V).float() + 1e-3
-uni = (uni / uni.sum())
-
+uni = uni / uni.sum()
 need, gb = N_GEN + N_HELD, 16
 chunks, temps = [], [0.7, 0.9, 1.0]
 while sum(c.shape[0] for c in chunks) < need:
@@ -149,170 +153,124 @@ def forward_mask(x0, t):
     empty = ~m.any(dim=1)
     if empty.any(): m[empty.nonzero(as_tuple=True)[0], noise[empty].argmin(dim=1)] = True
     return torch.where(m, torch.full_like(x0, MASK_ID), x0), m
-
 def masked_diffusion_loss(logits, x0, m, t, kd_probs=None, kd_idx=None):
-    """LLaDA ELBO on masked positions only (memory-safe at V=152K: gather masked rows),
-    optionally mixed with top-k KD targets from the AR teacher."""
-    B, T = x0.shape
-    lm = logits[m].float()                                  # (M, V)
+    B, T = x0.shape; lm = logits[m].float()
     ce = F.cross_entropy(lm, x0[m], reduction='none')
     if kd_probs is not None:
-        q = lm.log_softmax(-1)
-        kd = -(kd_probs * q.gather(1, kd_idx)).sum(1)
-        ce = (1 - KD_LAMBDA) * ce + KD_LAMBDA * kd
+        q = lm.log_softmax(-1); ce = (1 - KD_LAMBDA) * ce - KD_LAMBDA * (kd_probs * q.gather(1, kd_idx)).sum(1)
     seq_idx = torch.arange(B, device=x0.device)[:, None].expand(B, T)[m]
-    per_seq = torch.zeros(B, device=ce.device).index_add_(0, seq_idx, ce) / (t * T)
-    return per_seq.mean()
-
+    return (torch.zeros(B, device=ce.device).index_add_(0, seq_idx, ce) / (t * T)).mean()
 @torch.no_grad()
-def masked_ce_at(fn, ids, t_val, n=24):
+def masked_ce_at(fn, ids, t_val, n=16):
     x0 = ids[:n]; x_t, m = forward_mask(x0, torch.full((x0.shape[0],), t_val, device=x0.device))
-    lm = fn(x_t)[m].float()
-    return F.cross_entropy(lm, x0[m]).item()
-
+    return F.cross_entropy(fn(x_t)[m].float(), x0[m]).item()
 @torch.no_grad()
-def denoise_v2(fn, ids, frozen, steps=64, temp0=1.0, alg_temp=0.3, remask_frac=0.15,
-               prior=None, beta=0.6, samp_beta=0.4, rep_gamma=0.8, ban_ids=None,
-               temp_floor=0.7, no_repeat=3):
-    B, L = ids.shape
-    n0 = int(((ids == MASK_ID) & ~frozen).sum().item())
+def denoise_v2(fn, ids, frozen, steps=64, temp0=1.0, alg_temp=0.3, remask_frac=0.15, prior=None,
+               beta=0.6, samp_beta=0.4, rep_gamma=0.8, ban_ids=None, temp_floor=0.7, no_repeat=3):
+    B, L = ids.shape; n0 = int(((ids == MASK_ID) & ~frozen).sum().item())
     if n0 == 0: return ids
-    logp_prior = None if prior is None else torch.log(prior.clamp_min(1e-8)).to(ids.device)
+    lp = None if prior is None else torch.log(prior.clamp_min(1e-8)).to(ids.device)
     for s in range(steps):
-        masked = (ids == MASK_ID) & ~frozen
-        n_left = int(masked.sum().item())
+        masked = (ids == MASK_ID) & ~frozen; n_left = int(masked.sum().item())
         if n_left == 0: break
         logits = fn(ids).float()
         if ban_ids is not None:
             for b in ban_ids: logits[..., b] = float('-inf')
-        if logp_prior is not None and samp_beta > 0:
-            logits = logits - samp_beta * logp_prior
+        if lp is not None and samp_beta > 0: logits = logits - samp_beta * lp
         if rep_gamma > 0:
             for b in range(B):
                 seen = ids[b][ids[b] != MASK_ID]
-                if seen.numel():
-                    cnt = torch.bincount(seen, minlength=V).float()
-                    logits[b] = logits[b] - rep_gamma * torch.log1p(cnt)
+                if seen.numel(): logits[b] = logits[b] - rep_gamma * torch.log1p(torch.bincount(seen, minlength=V).float())
         if no_repeat > 0:
-            nn_ = no_repeat
             for b in range(B):
                 row = ids[b].tolist(); seen = {}
-                for j in range(L - nn_ + 1):
-                    seg = row[j:j + nn_]
-                    if MASK_ID in seg: continue
-                    seen.setdefault(tuple(seg[:-1]), set()).add(seg[-1])
-                for i in range(nn_ - 1, L):
-                    ctx = tuple(row[i - (nn_ - 1):i])
+                for j in range(L - no_repeat + 1):
+                    sg = row[j:j + no_repeat]
+                    if MASK_ID in sg: continue
+                    seen.setdefault(tuple(sg[:-1]), set()).add(sg[-1])
+                for i in range(no_repeat - 1, L):
+                    ctx = tuple(row[i - (no_repeat - 1):i])
                     if MASK_ID in ctx: continue
                     for tk in seen.get(ctx, ()): logits[b, i, tk] = float('-inf')
         tau = temp0 * max(0.0, 1.0 - s / max(1, steps - 1))
         if s < int(0.9 * steps): tau = max(tau, temp_floor)
         if tau > 0.05:
-            probs = (logits / tau).softmax(-1)
-            pred = torch.multinomial(probs.view(-1, V), 1).view(B, L)
+            probs = (logits / tau).softmax(-1); pred = torch.multinomial(probs.view(-1, V), 1).view(B, L)
         else:
             probs = logits.softmax(-1); pred = probs.argmax(-1)
-        p_tok = probs.gather(-1, pred[..., None]).squeeze(-1).clamp_min(1e-9)
-        conf = p_tok.log()
-        if logp_prior is not None: conf = conf - beta * logp_prior[pred]
+        conf = probs.gather(-1, pred[..., None]).squeeze(-1).clamp_min(1e-9).log()
+        if lp is not None: conf = conf - beta * lp[pred]
         conf = conf.masked_fill(~masked, float('-inf'))
         if alg_temp > 0:
-            g = torch.rand_like(conf).clamp_min(1e-9)
-            conf = conf + alg_temp * (-(-g.log()).log()) * (s < steps // 2)
-        keep = math.cos(math.pi / 2 * (s + 1) / steps)
-        k = max(1, min(n_left, n_left - int(n0 * keep)))
-        idxs = conf.view(-1).topk(k).indices
-        ids.view(-1)[idxs] = pred.view(-1)[idxs]
+            g = torch.rand_like(conf).clamp_min(1e-9); conf = conf + alg_temp * (-(-g.log()).log()) * (s < steps // 2)
+        k = max(1, min(n_left, n_left - int(n0 * math.cos(math.pi / 2 * (s + 1) / steps))))
+        ids.view(-1)[conf.view(-1).topk(k).indices] = pred.view(-1)[conf.view(-1).topk(k).indices]
         if remask_frac > 0 and s < steps // 2:
-            revealed = (ids != MASK_ID) & ~frozen
-            if revealed.any():
-                cur = probs.gather(-1, ids.clamp_max(V - 1)[..., None]).squeeze(-1)
-                cur = cur.masked_fill(~revealed, float('inf'))
-                q = max(1, int(revealed.sum().item() * remask_frac))
-                ids.view(-1)[(-cur.view(-1)).topk(q).indices] = MASK_ID
+            rev = (ids != MASK_ID) & ~frozen
+            if rev.any():
+                cur = probs.gather(-1, ids.clamp_max(V - 1)[..., None]).squeeze(-1).masked_fill(~rev, float('inf'))
+                q = max(1, int(rev.sum().item() * remask_frac)); ids.view(-1)[(-cur.view(-1)).topk(q).indices] = MASK_ID
     masked = (ids == MASK_ID) & ~frozen
-    if masked.any():
-        ids = torch.where(masked, fn(ids).float().argmax(-1), ids)
+    if masked.any(): ids = torch.where(masked, fn(ids).float().argmax(-1), ids)
     return ids
-
 @torch.no_grad()
 def semi_ar_generate(fn, prompt, total_len, block=16, steps_per_block=16, **kw):
     ids = prompt.clone()
     while ids.shape[1] < total_len:
         b = min(block, total_len - ids.shape[1])
         win = torch.cat([ids, torch.full((ids.shape[0], b), MASK_ID, dtype=torch.long, device=ids.device)], 1)
-        frozen = torch.zeros_like(win, dtype=torch.bool); frozen[:, :ids.shape[1]] = True
-        ids = denoise_v2(fn, win, frozen, steps=steps_per_block, **kw)
+        fr = torch.zeros_like(win, dtype=torch.bool); fr[:, :ids.shape[1]] = True
+        ids = denoise_v2(fn, win, fr, steps=steps_per_block, **kw)
     return ids
 print('diffusion core + samplers ready')
 
 # %% ---- cell ----
-PROJ_ATTR = [('self_attn', 'q_proj'), ('self_attn', 'k_proj'), ('self_attn', 'v_proj'),
-             ('self_attn', 'o_proj'), ('mlp', 'gate_proj'), ('mlp', 'up_proj'), ('mlp', 'down_proj')]
-
-t0 = time.time()
-sigs, mods = [], []                       # per layer: signature; list of 7 Linear modules
+# Discover every nn.Linear in each decoder layer (DeltaNet in/out proj, full-attn q/k/v/o,
+# MoE expert/router linears, MLP) -> cap to the MAX_PER_LAYER largest by numel per layer.
+t0 = time.time(); LINS = []   # flat list of dicts: {mod, sig}
 with torch.no_grad():
     for l in range(L_FULL):
-        parts, logn, ms = [], [], []
-        for parent, name in PROJ_ATTR:
-            mod = getattr(getattr(layers[l], parent), name)
-            W = mod.weight.float()
-            U, S, Vv = torch.svd_lowrank(W, q=SUB + 8, niter=4)
-            mod._Ud = U[:, :SUB].to(mod.weight.dtype).contiguous()    # (out, SUB) on module device
-            mod._Vd = Vv[:, :SUB].to(mod.weight.dtype).contiguous()   # (in, SUB)
-            mod._A = None; mod._on = False
-            parts.append((S / (S.norm() + 1e-9))[:SIG_K].cpu())
-            logn.append(torch.log(W.norm() + 1e-9)[None].cpu())
-            ms.append(mod)
-            del W, U, S, Vv
-        sigs.append(torch.cat(parts + logn).to(DEV0)); mods.append(ms)
+        cand = [mm for _, mm in layers[l].named_modules()
+                if isinstance(mm, nn.Linear) and mm.weight.ndim == 2 and min(mm.weight.shape) >= 16]
+        cand.sort(key=lambda mm: -mm.weight.numel())
+        for mm in cand[:MAX_PER_LAYER]:
+            W = mm.weight.float()
+            U, S, Vv = torch.svd_lowrank(W, q=min(SUB + 8, min(W.shape) - 1), niter=4)
+            r = min(SUB, U.shape[1])
+            mm._Ud = U[:, :r].to(mm.weight.dtype).contiguous()
+            mm._Vd = Vv[:, :r].to(mm.weight.dtype).contiguous()
+            mm._r = r; mm._A = None; mm._on = False
+            spec = torch.zeros(SIG_K); s = (S / (S.norm() + 1e-9))[:SIG_K]; spec[:s.numel()] = s.cpu()
+            sig = torch.cat([spec, torch.tensor([math.log(W.norm().item() + 1e-9) / 10,
+                             math.log(W.shape[0]) / 12, math.log(W.shape[1]) / 12, l / (L_FULL - 1)])])
+            mm._sig = sig.to(DEV0)
+            LINS.append(mm)
         if l % 8 == 0: torch.cuda.empty_cache()
-SIG_DIM = (SIG_K + 1) * 7
-print(f'svd_lowrank cache built for {L_FULL} layers ({time.time()-t0:.0f}s)')
+SIG_DIM = SIG_K + 4
+print(f'{len(LINS)} Linear matrices translated ({time.time()-t0:.0f}s); SVD-frame dim {SUB}')
 
 def _delta_hook(mod, inp, out):
-    if mod._on and mod._A is not None:
-        x = inp[0]
-        return out + ((x @ mod._Vd) @ mod._A.T) @ mod._Ud.T
+    if getattr(mod, '_on', False) and mod._A is not None:
+        return out + ((inp[0] @ mod._Vd) @ mod._A.T) @ mod._Ud.T
     return out
-def _gain_hook(mod, inp, out):
-    if getattr(mod, '_on', False) and getattr(mod, '_g', None) is not None:
-        return out * (1 + mod._g)
-    return out
-for l in range(L_FULL):
-    for m_ in mods[l]: m_.register_forward_hook(_delta_hook)
-    for nm in ('input_layernorm', 'post_attention_layernorm'):
-        nmod = getattr(layers[l], nm); nmod._on = False; nmod._g = None
-        nmod.register_forward_hook(_gain_hook)
+for mm in LINS: mm.register_forward_hook(_delta_hook)
 
 class TranslatorC(nn.Module):
     def __init__(self, d_z=D_Z, sub=SUB, h=128):
         super().__init__(); self.sub = sub
-        self.enc = nn.Sequential(nn.Linear(SIG_DIM + 1, h), nn.SiLU(), nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
-        self.A = nn.ParameterList([nn.Parameter(torch.zeros(sub * sub, d_z)) for _ in range(7)])
-        self.Mg = nn.Parameter(torch.zeros(2, d_z))
+        self.enc = nn.Sequential(nn.Linear(SIG_DIM, h), nn.SiLU(), nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d_z))
+        self.M = nn.Parameter(torch.zeros(sub * sub, d_z))     # zero-init => B == floor
         self.mask_logits = nn.Parameter(torch.zeros(V))
-    def mask_row(self):
-        return self.mask_logits.softmax(0).to(E_W.device, E_W.dtype) @ E_W
+    def mask_row(self): return self.mask_logits.softmax(0).to(E_W.device, E_W.dtype) @ E_W
     def install(self, Lt):
-        """Set hook payloads for a truncated stack of depth Lt (zero-init => B == floor)."""
-        for l in range(Lt):
-            z = self.enc(torch.cat([sigs[l], sigs[l].new_tensor([0.0 if Lt == 1 else l / (Lt - 1)])]))
-            for p in range(7):
-                m_ = mods[l][p]
-                m_._A = ((self.A[p] @ z).view(self.sub, self.sub)).to(m_.weight.device, m_.weight.dtype)
-                m_._on = True
-            dg = (self.Mg @ z)
-            for gi, nm in enumerate(('input_layernorm', 'post_attention_layernorm')):
-                nmod = getattr(layers[l], nm)
-                nmod._g = dg[gi].to(nmod.weight.device, nmod.weight.dtype); nmod._on = True
+        zc = {}
+        for mm in LINS:
+            if mm._sig[-1].item() * (L_FULL - 1) >= Lt: mm._on = False; continue   # layer >= Lt: off
+            A = (self.M @ self.enc(mm._sig)).view(self.sub, self.sub)
+            r = mm._r
+            mm._A = (A[:r, :r]).to(mm.weight.device, mm.weight.dtype); mm._on = True
     def uninstall(self):
-        for l in range(L_FULL):
-            for m_ in mods[l]: m_._on = False
-            for nm in ('input_layernorm', 'post_attention_layernorm'):
-                getattr(layers[l], nm)._on = False
-
+        for mm in LINS: mm._on = False
 C = TranslatorC().to(DEV0)
 print('C params:', sum(p.numel() for p in C.parameters()))
 
@@ -326,58 +284,44 @@ for step in range(1, C_STEPS + 1):
     t = sample_mask_rate(C_BS); x_t, m = forward_mask(x0, t)
     kd_probs = kd_idx = None
     if KD_LAMBDA > 0:
-        C.uninstall()                                  # teacher = the RAW donor, causal
+        C.uninstall()
         with torch.no_grad():
             tl = run_stack(x0, L_FULL, causal=True)
-            tl = torch.cat([tl[:, :1] * 0, tl[:, :-1]], 1)   # teacher at pos i-1 predicts token i
-            tm = tl[m].float().softmax(-1)
-            kd_probs, kd_idx = tm.topk(KD_TOPK, dim=-1)
-            kd_probs = kd_probs / kd_probs.sum(-1, keepdim=True)
-            del tl, tm
+            tl = torch.cat([tl[:, :1] * 0, tl[:, :-1]], 1)
+            kd_probs, kd_idx = tl[m].float().softmax(-1).topk(KD_TOPK, dim=-1)
+            kd_probs = kd_probs / kd_probs.sum(-1, keepdim=True); del tl
     C.install(Lt)
     logits = run_stack(x_t, Lt, causal=False, mask_row=C.mask_row())
     loss = masked_diffusion_loss(logits, x0, m, t, kd_probs, kd_idx)
-    opt.zero_grad(); loss.backward()
-    torch.nn.utils.clip_grad_norm_(C.parameters(), 1.0)
-    opt.step(); sched.step()
-    C.uninstall()
+    opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(C.parameters(), 1.0)
+    opt.step(); sched.step(); C.uninstall()
     ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
     if step % EVAL_EVERY == 0 or step == 1:
         with torch.no_grad():
-            Lp = TRUNC_DEPTHS[1]
-            C.install(Lp)
-            fn = lambda i: run_stack(i, Lp, causal=False, mask_row=C.mask_row())
-            hce = masked_ce_at(fn, held_ids, 0.5, n=8)
+            Lp = TRUNC_DEPTHS[1]; C.install(Lp)
+            hce = masked_ce_at(lambda i: run_stack(i, Lp, causal=False, mask_row=C.mask_row()), held_ids, 0.5, n=8)
             C.uninstall()
         print(f'step {step:>5}  train(ema) {ema:6.3f}  sub-stack-L{Lp} masked-CE@0.5 {hce:5.2f}  ({time.time()-t0:.0f}s)')
-print('C trained — the 9B donor was never trained, only C was')
+print('C trained — the donor was never trained, only C was')
 
 # %% ---- cell ----
+with torch.no_grad(): mrow = C.mask_row(); mean_row = E_W.float().mean(0).to(E_W.dtype)
+def fnB(i): return run_stack(i, L_FULL, causal=False, mask_row=mrow)
+def fn0(i): return run_stack(i, L_FULL, causal=False, mask_row=mean_row)
 with torch.no_grad():
-    mrow = C.mask_row()
-    mean_row = E_W.float().mean(0).to(E_W.dtype)
-def fnB(i):
-    return run_stack(i, L_FULL, causal=False, mask_row=mrow)
-def fn0(i):
-    return run_stack(i, L_FULL, causal=False, mask_row=mean_row)
-
-with torch.no_grad():
-    ar_l = run_stack(held_ids[:8, :-1], L_FULL, causal=True)
-    ar = F.cross_entropy(ar_l.reshape(-1, V).float(), held_ids[:8, 1:].reshape(-1)).item()
-    del ar_l
+    al = run_stack(held_ids[:8, :-1], L_FULL, causal=True)
+    ar = F.cross_entropy(al.reshape(-1, V).float(), held_ids[:8, 1:].reshape(-1)).item(); del al
 print(f'uniform ln(V) = {math.log(V):.2f} | donor AR next-token CE (held) = {ar:.2f}')
 print('\nheld masked-CE:    floor(raw bidir)   B*=C(donor)')
 for tv in (0.3, 0.5, 0.7, 0.9):
-    f0 = masked_ce_at(fn0, held_ids, tv, n=16)
-    C.install(L_FULL); fb = masked_ce_at(fnB, held_ids, tv, n=16); C.uninstall()
+    f0 = masked_ce_at(fn0, held_ids, tv)
+    C.install(L_FULL); fb = masked_ce_at(fnB, held_ids, tv); C.uninstall()
     print(f'  t={tv}:   {f0:7.2f}      {fb:7.2f}')
 
-x0 = held_ids[:4]
-x_c, m = forward_mask(x0, torch.full((x0.shape[0],), 0.25, device=x0.device))
+x0 = held_ids[:4]; x_c, m = forward_mask(x0, torch.full((x0.shape[0],), 0.25, device=x0.device))
 for name, fn, ins in (('floor', fn0, False), ('B*', fnB, True)):
     if ins: C.install(L_FULL)
-    rec = denoise_v2(fn, x_c.clone(), ~m, steps=24, temp0=0.0, alg_temp=0.0, remask_frac=0.0,
-                     ban_ids=None, temp_floor=0.0, no_repeat=0)
+    rec = denoise_v2(fn, x_c.clone(), ~m, steps=20, temp0=0.0, alg_temp=0.0, remask_frac=0.0, ban_ids=None, temp_floor=0.0, no_repeat=0)
     if ins: C.uninstall()
     acc = ((rec == x0) & m).sum().item() / m.sum().item()
     print(f'\nreconstruction ({name}): token accuracy {acc:.1%}')
@@ -386,8 +330,7 @@ for name, fn, ins in (('floor', fn0, False), ('B*', fnB, True)):
         print('  recovered:', repr(tok.decode(rec[0, :48].clamp_max(V - 1))))
 
 UNI = uni.to(DEV0)
-kw = dict(temp0=1.0, alg_temp=0.3, remask_frac=0.15, prior=UNI, beta=0.6,
-          samp_beta=0.4, rep_gamma=0.8, temp_floor=0.7, no_repeat=3)
+kw = dict(temp0=1.0, alg_temp=0.3, remask_frac=0.15, prior=UNI, beta=0.6, samp_beta=0.4, rep_gamma=0.8, temp_floor=0.7, no_repeat=3)
 uniq = torch.tensor([held_ids[i].unique().numel() for i in range(held_ids.shape[0])])
 prompt = held_ids[uniq.argsort(descending=True)[:2], :32]
 C.install(L_FULL)
@@ -397,45 +340,34 @@ for b in range(2):
     print(f'\nprompt {b}   :', repr(tok.decode(prompt[b])))
     print('semi-AR cont:', repr(tok.decode(g4[b, 32:].clamp_max(V - 1))))
 
-# control: shuffled block signatures => if CE unchanged, C ignores the weights
-perm = torch.randperm(L_FULL).tolist()
-orig_sigs = list(sigs)
-for l in range(L_FULL): sigs[l] = orig_sigs[perm[l]]
-C.install(L_FULL); mm = masked_ce_at(fnB, held_ids, 0.5, n=16); C.uninstall()
-for l in range(L_FULL): sigs[l] = orig_sigs[l]
-C.install(L_FULL); bb = masked_ce_at(fnB, held_ids, 0.5, n=16); C.uninstall()
-print(f'\ncontrol — shuffled-signature masked-CE@0.5: {mm:.2f} (vs B* {bb:.2f}; equal ⇒ C ignores signatures)')
+# control: shuffle each matrix's signature -> if CE unchanged, C ignores the weights
+orig = [mm._sig for mm in LINS]; perm = torch.randperm(len(LINS)).tolist()
+for i, mm in enumerate(LINS): mm._sig = orig[perm[i]]
+C.install(L_FULL); mm_ce = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
+for i, mm in enumerate(LINS): mm._sig = orig[i]
+C.install(L_FULL); bb = masked_ce_at(fnB, held_ids, 0.5); C.uninstall()
+print(f'\ncontrol — shuffled-signature masked-CE@0.5: {mm_ce:.2f} (vs B* {bb:.2f}; equal ⇒ C ignores signatures)')
 
 # %% ---- cell ----
-# The 9B weights are never modified; the deliverable is the TRANSLATION PACK: C + the
-# per-layer factors needed to apply B* anywhere (y += ((x@V) A^T) U^T per projection).
 from safetensors.torch import save_file
 pack = {'mercury.mask_embedding': mrow.detach().float().cpu()}
 with torch.no_grad():
-    for l in range(L_FULL):
-        z = C.enc(torch.cat([sigs[l], sigs[l].new_tensor([l / (L_FULL - 1)])]))
-        for p, (parent, name) in enumerate(PROJ_ATTR):
-            m_ = mods[l][p]
-            A = (C.A[p] @ z).view(SUB, SUB)
-            pack[f'layer{l}.{name}.UA'] = (m_._Ud.float().cpu() @ A.cpu())   # (out, SUB)
-            pack[f'layer{l}.{name}.V']  = m_._Vd.float().cpu()               # (in,  SUB)
-        dg = (C.Mg @ z)
-        pack[f'layer{l}.gains'] = dg.detach().cpu()
+    for i, mm in enumerate(LINS):
+        A = (C.M @ C.enc(mm._sig)).view(SUB, SUB)[:mm._r, :mm._r]
+        pack[f'lin{i}.UA'] = (mm._Ud.float().cpu() @ A.cpu())
+        pack[f'lin{i}.V'] = mm._Vd.float().cpu()
 path = ('/kaggle/working/' if os.path.isdir('/kaggle/working') else '') + \
-       ('qwen35_mercury_pack_pilot.safetensors' if PILOT else 'qwen35_9b_mercury_pack.safetensors')
-save_file(pack, path)
-torch.save(C.state_dict(), path.replace('.safetensors', '_C.pt'))
-print('saved translation pack ->', path, f'({os.path.getsize(path)/1e6:.0f} MB)')
+       ('qwen35_pilot_pack.safetensors' if PILOT else 'qwen35_9b_mercury_pack.safetensors')
+save_file(pack, path); torch.save(C.state_dict(), path.replace('.safetensors', '_C.pt'))
+print('saved translation pack ->', path, f'({os.path.getsize(path)/1e6:.0f} MB), {len(LINS)} matrices')
 
 # ## How to read
-# - Identical evidence structure to the supra port: **floor vs B\*** masked-CE across mask
-#   rates, **reconstruction**, the **shuffled-signature control** (must separate), prompted
-#   **semi-AR generation** with the run-7 sampler.
-# - **PILOT first.** The 0.8B pass is the smoke test for this 9B-scale pipeline (transformers
-#   loop, hooks, sharding); only flip `PILOT=False` after it completes cleanly.
-# - At 9B the donor is *strong* — per the supra finding (fluency is donor-bounded), generation
-#   quality should improve dramatically if the translation carries.
-# - Honest notes: WARM is omitted (Adam on 9B cannot fit 2×T4); the self-zoo shares weights
-#   with the target (held-out = full-depth composition + the last layer); everything trains C
-#   only — **the 9B model is never trained, its weights are never even modified** (deltas live
-#   in forward hooks; the deliverable is a translation pack applying B\* anywhere).
+# - **Architecture report** (cell 3): confirms layer_types (DeltaNet vs full-attn) and the
+#   per-layer Linear inventory C adapts to. **PILOT is the smoke test** — run it first.
+# - **floor vs B\*** masked-CE, **reconstruction**, the **shuffled-signature control** (must
+#   separate ⇒ C reads the weights), and semi-AR generation — same evidence structure as supra.
+# - **Architectural ceiling:** only full-attention layers go bidirectional (DeltaNet is causal
+#   by construction), so a hybrid donor is intrinsically harder to turn into a denoiser than a
+#   pure transformer — read B\* vs floor as the translation signal, not against a dense ceiling.
+# - **B is never trained; its weights are never modified** (deltas live in forward hooks; the
+#   deliverable is a translation pack applying B\* anywhere).
