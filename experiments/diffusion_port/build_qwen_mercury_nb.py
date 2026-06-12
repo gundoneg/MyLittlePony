@@ -64,7 +64,7 @@ cells.append(code(
 "import torch.nn as nn",
 "import torch.nn.functional as F",
 "",
-"PILOT = True",
+"PILOT = False        # 0.8B pilot is CONFIRMED -> default is now the 9B port. Set True only to re-smoke.",
 "MODEL_ID = 'Qwen/Qwen3.5-0.8B' if PILOT else 'Qwen/Qwen3.5-9B'",
 "N_GEN    = 256 if PILOT else 512",
 "N_HELD   = 32  if PILOT else 48",
@@ -82,7 +82,9 @@ cells.append(code(
 "KD_LAMBDA, KD_TOPK = 0.3, 64",
 "EVAL_EVERY = 200 if PILOT else 400",
 "DEV0 = 'cuda:0' if torch.cuda.is_available() else 'cpu'",
-"print('PILOT' if PILOT else '9B RUN', '| model', MODEL_ID, '| GPUs', torch.cuda.device_count())",
+"print('=' * 60)",
+"print(f'  RUNNING: {\"PILOT 0.8B\" if PILOT else \"FULL 9B PORT\"}  ->  {MODEL_ID}')",
+"print('=' * 60)",
 ))
 
 # ---- cell 3: upgrade transformers, load (sharded fp16), fp32-conv patch, architecture report ----
