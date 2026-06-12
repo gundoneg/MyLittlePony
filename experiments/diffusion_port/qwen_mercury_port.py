@@ -1,5 +1,5 @@
-"""Qwen3.5-9B -> Mercury-2 diffusion by translator C (v4 + sharding fix + fail-fast dry-run).
-Kaggle GPU T4 x2 + Internet ON. Default = 9B."""
+"""Qwen3.5-9B -> Mercury-2 by translator C (v5: BUILD stamp + dry-run guard + sharding fix).
+Kaggle GPU T4 x2 + Internet ON. exec-smoked end-to-end via smoke_qwen_nb.py."""
 
 
 # # Qwen3.5 → Mercury-2 diffusion LM **by the translator C** (architecture-agnostic, at scale)
@@ -48,8 +48,9 @@ EPS_T    = 0.05
 KD_LAMBDA, KD_TOPK = 0.3, 64
 EVAL_EVERY = 200 if PILOT else 400
 DEV0 = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+BUILD = 'v5-2026-06-12'   # bump on every change; printed below so the running version is unmistakable
 print('=' * 60)
-print(f'  RUNNING: {"PILOT 0.8B" if PILOT else "FULL 9B PORT"}  ->  {MODEL_ID}')
+print(f'  BUILD {BUILD}  |  RUNNING: {"PILOT 0.8B" if PILOT else "FULL 9B PORT"}  ->  {MODEL_ID}')
 print('=' * 60)
 
 # %% ---- cell ----
@@ -149,6 +150,7 @@ def forward_mask(x0, t):
     if empty.any(): m[empty.nonzero(as_tuple=True)[0], noise[empty].argmin(dim=1)] = True
     return torch.where(m, torch.full_like(x0, MASK_ID), x0), m
 def masked_diffusion_loss(logits, x0, m, t, kd_probs=None, kd_idx=None):
+    assert logits.device == x0.device, f'device mismatch {logits.device} vs {x0.device} (sharding bug)'
     B, T = x0.shape; lm = logits[m].float()
     ce = F.cross_entropy(lm, x0[m], reduction='none')
     if kd_probs is not None:
@@ -317,6 +319,7 @@ _ = denoise_v2(lambda i: run_stack(i, L_FULL, causal=False, mask_row=C.mask_row(
 C.uninstall()
 del x0d, x_td, md_, kdp, kdi, ld, ids_d, fr_d
 gc.collect(); torch.cuda.empty_cache()
+_DRYRUN_OK = True
 print('PIPELINE DRY-RUN OK: train step + eval + sampler exercised end-to-end on both GPUs')
 
 # %% ---- cell ----
@@ -345,6 +348,7 @@ print('sample:', repr(tok.decode(train_ids[0, :48])))
 gc.collect(); torch.cuda.empty_cache()
 
 # %% ---- cell ----
+assert globals().get('_DRYRUN_OK'), 'Run the DRY-RUN cell first (you are on an old/partial notebook version).'
 opt = torch.optim.AdamW(C.parameters(), lr=LR)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 100))
 ema, t0 = None, time.time()
