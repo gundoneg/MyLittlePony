@@ -122,7 +122,7 @@ def run_stack(ids, Lt, causal=False, mask_row=None):
             kw.pop("position_embeddings", None)
             out = layers[l](h, **kw)
         h = out[0] if isinstance(out, tuple) else out
-    return model.lm_head(core.norm(h))
+    return model.lm_head(core.norm(h)).to(ids.device)   # device convention parity with the notebook
 
 
 with torch.no_grad():

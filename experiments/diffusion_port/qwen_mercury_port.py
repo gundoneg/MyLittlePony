@@ -1,5 +1,5 @@
-"""Qwen3.5-9B -> Mercury-2 diffusion by translator C (v4). Kaggle GPU T4 x2 + Internet ON.
-DEFAULT = 9B port. Set PILOT=True in cell 2 only to re-run the 0.8B smoke."""
+"""Qwen3.5-9B -> Mercury-2 diffusion by translator C (v4 + sharding fix + fail-fast dry-run).
+Kaggle GPU T4 x2 + Internet ON. Default = 9B."""
 
 
 # # Qwen3.5 → Mercury-2 diffusion LM **by the translator C** (architecture-agnostic, at scale)
@@ -113,7 +113,7 @@ def run_stack(ids, Lt, causal=False, mask_row=None):
     B, T = ids.shape
     h = core.embed_tokens(ids.to(E_W.device).clamp_max(V - 1))
     if mask_row is not None:
-        h = torch.where((ids.to(E_W.device) == MASK_ID)[..., None], mask_row.to(h.dtype), h)
+        h = torch.where((ids.to(E_W.device) == MASK_ID)[..., None], mask_row.to(h.device, h.dtype), h)
     pos_ids = torch.arange(T, device=h.device)[None].expand(B, T)
     pe = core.rotary_emb(h, pos_ids) if hasattr(core, 'rotary_emb') else None
     bias = make_bias(B, T, causal, h.device)
@@ -126,7 +126,10 @@ def run_stack(ids, Lt, causal=False, mask_row=None):
             kw.pop('position_embeddings', None); out = lay(h, **kw)
         h = out[0] if isinstance(out, tuple) else out
     h = core.norm(h.to(core.norm.weight.device))
-    return model.lm_head(h.to(model.lm_head.weight.device))
+    # DEVICE CONVENTION: logits always come back on the CALLER'S device (ids.device). With
+    # device_map sharding the lm_head can live on cuda:1 (it does at 9B), and every consumer
+    # (KD gather, losses, evals, samplers) indexes logits with ids/masks from cuda:0.
+    return model.lm_head(h.to(model.lm_head.weight.device)).to(ids.device)
 
 with torch.no_grad():
     p1 = torch.randint(4, 1000, (1, 8), device=DEV0)
@@ -137,31 +140,6 @@ with torch.no_grad():
     assert torch.allclose(a, b, atol=1e-2), 'causal leak!'
     print('run_stack ok | bidirectional changes output:', not torch.allclose(a, c, atol=1e-2),
           '(only full-attn layers go bidirectional; DeltaNet stays causal)')
-
-# %% ---- cell ----
-@torch.no_grad()
-def gen_batch(prompts, n_new, temperature):
-    am = (prompts != (tok.pad_token_id or 0)).long()
-    out = model.generate(prompts, attention_mask=am, max_new_tokens=n_new, do_sample=True,
-                         temperature=temperature, top_k=50, pad_token_id=tok.pad_token_id or 0)
-    return out[:, prompts.shape[1]:]
-
-t0 = time.time()
-bos_id = tok.bos_token_id if tok.bos_token_id is not None else (tok.pad_token_id or 0)
-boot = gen_batch(torch.full((24, 8), bos_id, dtype=torch.long, device=DEV0), SEQ_LEN // 2, 1.0)
-uni = torch.bincount(boot.reshape(-1).cpu().clamp_max(V - 1), minlength=V).float() + 1e-3
-uni = uni / uni.sum()
-need, gb = N_GEN + N_HELD, 16
-chunks, temps = [], [0.7, 0.9, 1.0]
-while sum(c.shape[0] for c in chunks) < need:
-    tt = temps[len(chunks) % len(temps)]
-    pr = torch.multinomial(uni.expand(gb, V), 4, replacement=True).to(DEV0)
-    chunks.append(gen_batch(pr, SEQ_LEN, tt).cpu())
-corpus = torch.cat(chunks, 0)[:need].clamp_max(V - 1)
-train_ids, held_ids = corpus[:N_GEN].to(DEV0), corpus[N_GEN:].to(DEV0)
-print(f'corpus from donor: train {tuple(train_ids.shape)} held {tuple(held_ids.shape)} in {time.time()-t0:.0f}s')
-print('sample:', repr(tok.decode(train_ids[0, :48])))
-gc.collect(); torch.cuda.empty_cache()
 
 # %% ---- cell ----
 def sample_mask_rate(b, device=DEV0): return EPS_T + (1.0 - EPS_T) * torch.rand(b, device=device)
@@ -315,6 +293,56 @@ class TranslatorC(nn.Module):
         for mm in LINS: mm._on = False
 C = TranslatorC().to(DEV0)
 print(f'C params: {sum(p.numel() for p in C.parameters())} | per-role generators: {len(PRESENT_ROLES)}')
+
+# %% ---- cell ----
+# Fail fast: one complete training step (cross-GPU KD teacher, install, bidirectional
+# student forward, loss, backward) plus the eval and sampler paths, on SYNTHETIC tokens --
+# any device/shape bug surfaces here in seconds instead of after the corpus generation.
+x0d = torch.randint(4, V - 1, (C_BS, SEQ_LEN), device=DEV0)
+td = sample_mask_rate(C_BS); x_td, md_ = forward_mask(x0d, td)
+with torch.no_grad():
+    tld = run_stack(x0d, L_FULL, causal=True)
+    tld = torch.cat([tld[:, :1] * 0, tld[:, :-1]], 1)
+    kdp, kdi = tld[md_].float().softmax(-1).topk(KD_TOPK, dim=-1)
+    kdp = kdp / kdp.sum(-1, keepdim=True); del tld
+C.install(TRUNC_DEPTHS[0])
+ld = masked_diffusion_loss(run_stack(x_td, TRUNC_DEPTHS[0], causal=False, mask_row=C.mask_row()),
+                           x0d, md_, td, kdp, kdi)
+ld.backward(); C.zero_grad(set_to_none=True); C.uninstall()
+_ = masked_ce_at(lambda i: run_stack(i, L_FULL, causal=False, mask_row=C.mask_row()), x0d, 0.5, n=2)
+ids_d = torch.full((1, 8), MASK_ID, dtype=torch.long, device=DEV0)
+fr_d = torch.zeros_like(ids_d, dtype=torch.bool)
+C.install(L_FULL)
+_ = denoise_v2(lambda i: run_stack(i, L_FULL, causal=False, mask_row=C.mask_row()), ids_d, fr_d, steps=2, prior=None)
+C.uninstall()
+del x0d, x_td, md_, kdp, kdi, ld, ids_d, fr_d
+gc.collect(); torch.cuda.empty_cache()
+print('PIPELINE DRY-RUN OK: train step + eval + sampler exercised end-to-end on both GPUs')
+
+# %% ---- cell ----
+@torch.no_grad()
+def gen_batch(prompts, n_new, temperature):
+    am = (prompts != (tok.pad_token_id or 0)).long()
+    out = model.generate(prompts, attention_mask=am, max_new_tokens=n_new, do_sample=True,
+                         temperature=temperature, top_k=50, pad_token_id=tok.pad_token_id or 0)
+    return out[:, prompts.shape[1]:]
+
+t0 = time.time()
+bos_id = tok.bos_token_id if tok.bos_token_id is not None else (tok.pad_token_id or 0)
+boot = gen_batch(torch.full((24, 8), bos_id, dtype=torch.long, device=DEV0), SEQ_LEN // 2, 1.0)
+uni = torch.bincount(boot.reshape(-1).cpu().clamp_max(V - 1), minlength=V).float() + 1e-3
+uni = uni / uni.sum()
+need, gb = N_GEN + N_HELD, 16
+chunks, temps = [], [0.7, 0.9, 1.0]
+while sum(c.shape[0] for c in chunks) < need:
+    tt = temps[len(chunks) % len(temps)]
+    pr = torch.multinomial(uni.expand(gb, V), 4, replacement=True).to(DEV0)
+    chunks.append(gen_batch(pr, SEQ_LEN, tt).cpu())
+corpus = torch.cat(chunks, 0)[:need].clamp_max(V - 1)
+train_ids, held_ids = corpus[:N_GEN].to(DEV0), corpus[N_GEN:].to(DEV0)
+print(f'corpus from donor: train {tuple(train_ids.shape)} held {tuple(held_ids.shape)} in {time.time()-t0:.0f}s')
+print('sample:', repr(tok.decode(train_ids[0, :48])))
+gc.collect(); torch.cuda.empty_cache()
 
 # %% ---- cell ----
 opt = torch.optim.AdamW(C.parameters(), lr=LR)
