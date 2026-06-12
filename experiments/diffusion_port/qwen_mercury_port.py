@@ -1,5 +1,5 @@
-"""Qwen3.5 -> Mercury-2 diffusion by translator C (v4, pilot-confirmed). Kaggle GPU T4 x2 + INTERNET ON.
-PILOT pilot done; set PILOT=False for the 9B port (~5-6h)."""
+"""Qwen3.5 -> Mercury-2 diffusion by translator C (v4). Kaggle GPU T4 x2 + Internet ON.
+PILOT pilot confirmed; set PILOT=False for the 9B port."""
 
 
 # # Qwen3.5 → Mercury-2 diffusion LM **by the translator C** (architecture-agnostic, at scale)
@@ -52,21 +52,19 @@ print('PILOT' if PILOT else '9B RUN', '| model', MODEL_ID, '| GPUs', torch.cuda.
 
 # %% ---- cell ----
 import subprocess, sys
-def _tf_ok():
-    try:
-        import transformers as _t
-        maj, mnr = (int(x) for x in _t.__version__.split('.')[:2])
-        return (maj, mnr) >= (5, 8)
-    except Exception:
-        return False
-if not _tf_ok():
-    r = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-U',
-                        'transformers>=5.8', 'accelerate'])
-    if r.returncode != 0 or not _tf_ok():
-        raise RuntimeError(
-            'Cannot get transformers>=5.8 (needed for model_type qwen3_5). Most likely the '
-            'notebook has NO INTERNET: enable it in the right panel -> Session options -> '
-            'Internet -> ON, then Run All again.')
+from importlib.metadata import version, PackageNotFoundError
+def _tf_ver():
+    try: return tuple(int(x) for x in version('transformers').split('.')[:2])
+    except PackageNotFoundError: return (0, 0)
+if _tf_ver() < (5, 8):
+    # ignore pip's return code: it exits non-zero on Kaggle's PRE-EXISTING dask/cuml/numba
+    # conflicts even when transformers installs fine. Judge success by the on-disk version,
+    # read via importlib.metadata (NOT by importing transformers, which would cache 5.0.0).
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-U',
+                    'transformers>=5.8', 'accelerate'])
+if _tf_ver() < (5, 8):
+    raise RuntimeError('Need transformers>=5.8 for model_type qwen3_5 but it is not installed. '
+                       'Enable Internet (right panel -> Session options -> Internet -> ON) and Run All.')
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import transformers; print('transformers', transformers.__version__)
 tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
