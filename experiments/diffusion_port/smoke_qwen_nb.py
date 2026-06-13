@@ -22,7 +22,7 @@ repl = {
     r"C_BS     = 4   if PILOT else 2": "C_BS     = 2",
     r"SUB      = 48[^\n]*": "SUB      = 8",
     r"EVAL_EVERY = 200 if PILOT else 400": "EVAL_EVERY = 2",
-    r"torch_dtype=torch\.float16": "torch_dtype=torch.float32",   # CPU has no fp16 matmul path
+    r"torch_dtype=torch\.bfloat16": "torch_dtype=torch.float32",   # CPU smoke: plain fp32
 }
 for k, v in repl.items():
     src, n = re.subn(k, v, src)
